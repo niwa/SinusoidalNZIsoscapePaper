@@ -1,0 +1,1142 @@
+---
+title: "Precipitation sinusoidal isocape model: model fitting and regressions"
+author: "Andy McKenzie (NIWA), Bruce Dudley (NIWA)"
+date: "`r format(Sys.Date(), '%d %B, %Y')`"
+output:
+  html_document: 
+    theme: united
+    code_folding: show
+    toc: yes
+    toc_float:
+      collapsed: true   
+    fig_caption: yes
+    number_sections: yes
+    df_print: kable
+  word_document: 
+    toc: yes
+  pdf_document: 
+    toc: yes
+    fig_caption: yes
+    number_sections: yes
+editor_options:
+  chunk_output_type: console
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+# Global options
+#
+# echo = TRUE. Show the code
+# comment = "". Don't put anything in front of results from code
+# warning = FALSE. Don't display warning messages
+# cache = TRUE. Only process new code when you knit
+# dev = 'png'. Save graphics in figure folder as png
+# fig.height = 5. Height of figures (in inches)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  comment = "",
+  warning = FALSE,
+  message = FALSE,
+  cache = FALSE,
+  dev = "png", dpi = 300,
+  fig.height = 5
+)
+
+
+# tidyverse packages
+library(tidyr)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(lubridate)
+library(purrr)
+
+# summary of data frame columns
+library(skimr)
+
+library(GGally) # for scatterplots with correlation with ggpairs()
+
+# https://docs.stadiamaps.com/guides/migrating-from-stamen-map-tiles/#ggmap
+# devtools::install_github("stadiamaps/ggmap”)
+library(ggmap) # get_stamenmap() & ggmap
+# register_stadiamaps("ff428357-71cc-4a08-8912-9111113265ec", write = TRUE)
+
+# For map plotting
+library(sf)
+library(stars)
+
+# devtools::install_github("ropensci/rnaturalearthhires")
+library(rnaturalearthhires)
+library(rnaturalearth)
+library(rnaturalearthdata)
+
+library(ggrepel) # geom_text_repel()
+library(cowplot) # multiple plots for a figure
+
+library(caret) # For LOOCV
+
+library(skimr) # summary of data
+
+library(robustbase)
+library(modelr)
+library(dotwhisker) # dot whisker plot for multiple regression results
+library(broom) # glance(), tidy() for linear regressions
+
+# model kriggin
+library(gstat)
+
+# For reading in global isotope prediction maps
+library(raster)
+
+library(flextable)
+set_flextable_defaults(big.mark = "")
+
+
+unlink("Output/ModelFitResults", recursive = TRUE)
+dir.create("Output/ModelFitResults")
+
+
+rm(list = ls())
+source("auxiliary.code.R")
+
+ft <- function(input.data, caption = "", num.rows = Inf) {
+  ft <- input.data |>
+    slice_head(n = num.rows) |>
+    flextable() |>
+    autofit() |>
+    theme_zebra() |>
+    set_caption(caption)
+  ft
+}
+```
+
+
+# Load in data
+
+
+
+```{r}
+# d18O and dD data
+load("ProcessedData/ddata.RData")
+load("ProcessedData/ddata2.RData")
+slice_head(ddata, n = 5)
+
+# site characteristics
+load("Output/Data/site.climate.summary.RData")
+glimpse(site.climate.summary)
+
+# agent locations
+load("Output/Data/vcsn.agent.locations1.RData")
+slice_head(vcsn.agent.locations1, n = 5)
+
+# mean value of VCSN climate data at agent locations
+load("Output/Data/vcsn.mean.RData")
+glimpse(vcsn.mean)
+
+# Same as vcsn.mean, but (a) Prefix VCSN for "Agent", "lat", 
+load("Output/Data/national.climate.summary.RData")
+glimpse(national.climate.summary)
+
+site.info.orig <- readr::read_csv("data/lookup_rainsite_VCSN.csv")
+site.info <- site.info.orig |>
+  dplyr::select(Site = site_numbe, area, lat, lon = long, height = ELEVATION)
+slice_head(site.info, n = 5)
+```
+
+
+# Fitting sinusoidal curve to each site
+
+## Fitting procedure
+
+A sinusoidal curve is fitted to each site (Allen et al. 2018, p. 4861)
+of the form:
+
+$$quantity = Amplitude*sin(2\pi*Julian.Day.Fraction - phase) + offset$$
+where `Julian.Day.Fraction` is zero at the start of the year, and one at
+the end.
+
+If the phase is positive the sin curve is shifted to the right, and if
+the phase is negative the sin curve is shifted to the left.
+
+The fitting procedure details are:
+
+(a) Non-linear fit with estimation of amplitude, phase, and offset
+    (including estimation error)
+
+(b) Emulating a previous robust fitting procedure, a **Huber** weighting
+    is given to residuals. This can easily be changed to **bisquare**
+
+(c) Fitted using the **nlrob** function from the *robustbase* R package.
+
+(d) Bounds are set for the estimated parameters
+    ($0 \le Amplitude \le 10$, $-\pi \le phase \le \pi$,
+    $-20 \le offset \le 0$). If bounds are not set then for some sites a
+    negative value is estimated for the amplitude, and large values for
+    the phase.
+
+The fitting function `iso_fit_sinusoidal_model()` needs to be supplied
+the arguments:
+
+1.  The data (ddata)
+2.  The name of the column containing the site ID ("Site")
+3.  The name of the column containing the date ("Date")
+4.  The name of the column containing the quantity that is to be fitted
+    to ("d18O")
+
+```{r}
+mods.d18O <- iso_fit_sinusoidal_model(ddata, "Site", "Date", "d18O",
+  lower.limits = c(Amplitude = 0.1, phase = -3.1416, offset = -10),
+  upper.limits = c(Amplitude = 5.0, phase = 3.1416, offset = -3)
+)
+```
+
+Same for dD EXCEPT changed bounds to scale for the difference between dD and d18O. 
+In NZ (and globally) dD = 8*d18O+10 so bounds changed to:
+
+foe dD, bounds are set for the estimated parameters
+    ($0 \le Amplitude \le 90$, $-\pi \le phase \le \pi$,
+    $-150 \le offset \le -10$). If bounds are not set then for some sites a
+    negative value is estimated for the amplitude, and large values for
+    the phase.
+    
+```{r}
+mods.dD <- iso_fit_sinusoidal_model(ddata2, "Site", "Date", "dD",
+  lower.limits = c(Amplitude = 0.1, phase = -3.1416, offset = -150),
+  upper.limits = c(Amplitude = 90, phase = 3.1416, offset = -10)
+)
+```
+
+The output is a model object containing fitted parameters, residuals,
+fitted sinusoidal curves, etc.
+
+## Fitted curves
+
+Fitted sinusoidal curves are shown for all sites, or selected sites.
+
+```{r, fig.height=8}
+iso_plot_fitted_curve(mods.dD, sites = paste(1:20))
+iso_plot_fitted_curve(mods.dD, sites = paste(21:41))
+iso_plot_fitted_curve(mods.dD, sites = paste(42:58))
+```
+For dD
+```{r, fig.height=8}
+iso_plot_fitted_curve(mods.dD, sites = paste(1:20))
+iso_plot_fitted_curve(mods.dD, sites = paste(21:41))
+iso_plot_fitted_curve(mods.dD, sites = paste(42:58))
+```
+
+## Residuals
+
+Residuals are shown for each site, and all sites combined.
+
+```{r, fig.height=12}
+iso_plot_residuals(mods.d18O)
+```
+dD residuals for each site, and all sites combined.
+
+```{r, fig.height=12}
+iso_plot_residuals(mods.dD)
+```
+
+```{r}
+iso_plot_residuals(mods.d18O, combined = TRUE)
+```
+
+## RMSE and MAD
+
+Room mean square error (RMSE) and median absolute deviation (MAD).
+Latter these are plotted on a map by site.
+
+```{r}
+RMSE.by.site <- iso_extract_RMSE_by_site(mods.d18O)
+slice_head(RMSE.by.site, n = 5)
+```
+for dD
+
+```{r}
+RMSE.by.site.dD <- iso_extract_RMSE_by_site(mods.dD)
+slice_head(RMSE.by.site.dD, n = 5)
+```
+
+
+```{r}
+MAD.by.site <- iso_extract_MAD_by_site(mods.d18O)
+slice_head(MAD.by.site, n = 5)
+```
+
+for dD
+
+```{r}
+MAD.by.site.dD <- iso_extract_MAD_by_site(mods.dD)
+slice_head(MAD.by.site.dD, n = 5)
+```
+
+Plots below not repeated for dD
+
+```{r}
+plot.RMSE <- ggplot(data = RMSE.by.site, aes(x = Site, y = RMSE)) +
+  geom_col(fill = "blue") +
+  ggtitle("Root mean square error (RMSE) by site")
+plot.RMSE
+```
+
+```{r}
+plot.MAD <- ggplot(data = MAD.by.site, aes(x = Site, y = MAD)) +
+  geom_col(fill = "blue") +
+  ggtitle("Median absolute deviation/residual (MAD) by site")
+plot.MAD
+```
+
+Interactive version of plots
+
+```{r}
+plotly::ggplotly(plot.RMSE, width = 800, height = 600)
+```
+
+```{r}
+plotly::ggplotly(plot.MAD, width = 800, height = 600)
+```
+
+```{r}
+plot.MAD <- ggplot(data = MAD.by.site, aes(x = Site, y = MAD)) +
+  geom_col(fill = "blue") +
+  ggtitle("Median absolute deviation/residual (MAD) by site")
+plot.MAD
+```
+
+Interactive version of plot
+
+```{r}
+plotly::ggplotly(plot.MAD, width = 800, height = 600)
+```
+
+## Parameter estimates
+
+### Tables
+
+Parameter estimates with standard error, test-statistic (t-value), and
+associated p-value.
+
+```{r}
+params.d18O.full <- iso_extract_parameters(mods.d18O)
+
+params.d18O.full |>
+  slice_head(n = 10) |>
+  flextable() |>
+  set_formatter(p.value = function(x) {
+    formatC(x, format = "e", digits = 3)
+  }) |>
+  autofit() |>
+  theme_zebra() |>
+  set_caption("Parameter estimates and error (first ten rows).")
+
+readr::write_csv(params.d18O.full, "Output/ModelFitResults/params.d18O.full.csv")
+```
+
+Or just the parameter estimates in a nicer looking format.
+
+```{r}
+params.d18O.est.only <- iso_extract_parameters(mods.d18O, estimates.only = TRUE)
+ft(params.d18O.est.only, caption = "Parameter estimates only (first ten rows).", num.rows = 10)
+
+readr::write_csv(params.d18O.est.only, "Output/ModelFitResults/params.d18O.est.only.csv")
+```
+same again for dD
+```{r}
+params.dD.full <- iso_extract_parameters(mods.dD)
+
+params.dD.full |>
+  slice_head(n = 10) |>
+  flextable() |>
+  set_formatter(p.value = function(x) {
+    formatC(x, format = "e", digits = 3)
+  }) |>
+  autofit() |>
+  theme_zebra() |>
+  set_caption("Parameter estimates and error (first ten rows).")
+
+readr::write_csv(params.dD.full, "Output/ModelFitResults/dDfits.csv")
+```
+
+Or just the parameter estimates in a nicer looking format.
+
+```{r}
+params.dD.est.only <- iso_extract_parameters(mods.dD, estimates.only = TRUE)
+ft(params.dD.est.only, caption = "Parameter estimates only (first ten rows).", num.rows = 10)
+
+readr::write_csv(params.dD.est.only, "Output/ModelFitResults/dDfits.est.only.csv")
+```
+
+### Plots
+
+Whiskers plotted with 95% confidence intervals.
+
+```{r , fig.height=8}
+iso_plot_fitted_parameters(mods.d18O, "Amplitude")
+```
+
+```{r , fig.height=8}
+iso_plot_fitted_parameters(mods.d18O, "phase")
+```
+
+```{r , fig.height=8}
+iso_plot_fitted_parameters(mods.d18O, "offset")
+```
+
+# Correlations
+
+## Between estimated parameters
+
+There is some correlation between the estimated phase and offset
+parameters. As the estimated phase value increases, the estimated offset
+value decreases.
+
+```{r data parameter estimates}
+params.estimates <- iso_extract_parameters(mods.d18O, estimates.only = TRUE)
+
+params.estimates |>
+  dplyr::select(-Site) |>
+  GGally::ggpairs()
+```
+
+## Between estimated parameters and basic site characteristics
+
+```{r data combined parameters and site info}
+# neg.phase.days is how many days the sin curve is shifted to the left
+combine.data <- params.estimates |>
+  left_join(site.info) |>
+  mutate(neg.phase = -phase, .after = phase) |>
+  mutate(neg.phase.days = -phase / (2 * pi) * 365.25, .after = neg.phase) |>
+  mutate(neg.offset = -offset, .after = offset)
+
+combine.data <- combine.data |>
+  mutate(island = if_else(lon <= 174.49 & lat <= -40.18,
+    "South Island",
+    "North Island"
+  ))
+
+slice_head(combine.data, n = 5)
+save(combine.data, file = "Output/Data/combine.data.RData")
+```
+
+
+
+```{r}
+combine.vcsn <- combine.data |> 
+  left_join(site.climate.summary)
+```
+
+```{r}
+combine.vcsn.reg <- combine.vcsn |> 
+  dplyr::select(-neg.phase, -neg.phase.days, -neg.offset, -lat, -lon, 
+                -Tmin, -TMax, 
+                -Tmin_N, -Tmax_N,
+                -Rain)
+
+slice_head(combine.vcsn.reg, n = 5)
+save(combine.vcsn.reg, file = "Output/Data/combine.vcsn.reg.RData")
+```
+
+
+
+
+
+The *Amplitude* increases with longitude.
+
+The *phase* decrease with latitude
+
+The *offset* increases with latitude and longitude.
+
+```{r plot combined correlation}
+combine.data |>
+  dplyr::select(-Site, -area) |>
+  dplyr::select(-contains("neg")) |>
+  GGally::ggpairs()
+```
+
+Shown below are some of the higher correlations of estimated parameters
+with longitude, latitude, and height.
+
+```{r plot amplitude vs lon}
+ggplot(combine.data, aes(x = lon, y = Amplitude)) +
+  geom_point(colour = "blue", size = 3) +
+  xlab("Longitude") +
+  ggtitle("Amplitude versus longitude")
+```
+
+```{r plot phase vs latitude}
+ggplot(combine.data, aes(x = lat, y = phase)) +
+  geom_point(colour = "blue", size = 3) +
+  xlab("Latitude") +
+  ggtitle("phase versus latitude")
+```
+
+```{r plot offset vs lat}
+ggplot(combine.data, aes(x = lat, y = offset)) +
+  geom_point(colour = "blue", size = 3) +
+  xlab("Latitude") +
+  ggtitle("offset versus latitude")
+```
+
+```{r plot offset vs height}
+ggplot(combine.data, aes(x = height, y = offset)) +
+  geom_point(colour = "blue", size = 3) +
+  xlab("Height (m)") +
+  ggtitle("offset versus height")
+```
+
+
+# Spatial distribution of estimated parameters
+
+## Static maps
+
+The area of circles is proportional to the quantity value, with the
+colour shading binned.
+
+The absolute value of the phase and offset are plotted (i.e. the
+negative of their actual values), so the area is circle is proportional
+to the absolute value of them.
+
+For the phase, this is also converted to days by multiplying by 365.25.
+
+A phase value of zero implies a peak for the sin curve one quarter of
+the way through the year (about 91 days). All phase values are negative,
+implying a shift of the sinusoidal curve to the left.
+
+```{r}
+s1 <- iso_plot_spatial_static(combine.data, "Site", "lat", "lon", "Amplitude")
+s2 <- iso_plot_spatial_static(combine.data, "Site", "lat", "lon", "neg.phase")
+s2.day <- iso_plot_spatial_static(combine.data, "Site", "lat", "lon", "neg.phase.days")
+s3 <- iso_plot_spatial_static(combine.data, "Site", "lat", "lon", "neg.offset")
+
+s1
+s2
+s2.day
+s3
+
+cowplot::plot_grid(s1, s3)
+cowplot::plot_grid(s1, s2)
+```
+
+```{r}
+```
+
+Root mean square error by site
+
+```{r}
+RMSE.by.site.with.lat.lon <- iso_extract_RMSE_by_site(mods.d18O) |>
+  left_join(site.info)
+iso_plot_spatial_static(RMSE.by.site.with.lat.lon, "Site", "lat", "lon", "RMSE")
+```
+
+Median absolute deviation (i.e. residual) by site.
+
+```{r}
+MAD.by.site.with.lat.lon <- iso_extract_MAD_by_site(mods.d18O) |>
+  left_join(site.info)
+plot.MAD.by.site <- iso_plot_spatial_static(
+  MAD.by.site.with.lat.lon,
+  "Site", "lat", "lon", "MAD"
+)
+plot.MAD.by.site
+```
+
+
+
+# Correlation of sinusoidal predictors with VCSN predictors
+
+
+
+## Amplitude
+
+```{r}
+iso_plot_spatial_static(combine.data, "Site", "lat", "lon", "Amplitude")
+```
+
+```{r plot amplitude vs VCSN predictors}
+amp.long <- combine.vcsn.reg |> 
+  dplyr::select(Amplitude, height, VCSN.lat: Wind, AnnualTempRange) |> 
+  pivot_longer(cols = -Amplitude, names_to = "Predictor", values_to = "Value")
+
+ggplot(amp.long, aes(x = Value, y = Amplitude)) +
+  geom_point(colour = "blue") +
+  facet_wrap(vars(Predictor), scale = "free_x")
+```
+
+
+```{r correlation Amplitude with Rad SoilM and annual temperature range, cache=FALSE}
+corr.Amp.Rad <-   round(cor(combine.vcsn.reg$Amplitude, combine.vcsn.reg$Rad), 2)
+corr.Amp.SoilM <- round(cor(combine.vcsn.reg$Amplitude, combine.vcsn.reg$SoilM), 2)
+corr.Amp.AnnualTempRange <- round(cor(combine.vcsn.reg$Amplitude, combine.vcsn.reg$AnnualTempRange), 2)
+```
+
+
+The estimated sinusoidal Amplitude has highest correlation with
+Rad (`r corr.Amp.Rad`) and SoilM (`r corr.Amp.SoilM`).
+
+```{r}
+combine.vcsn.reg |> 
+  dplyr::select(Amplitude, height, ETmp: Wind, AnnualTempRange) |> 
+  GGally::ggpairs()
+```
+
+Ignoring lat/lon a tree regression picks out SoilM as of importance for explaining 
+variation in the Amplitude, following by interactions with MSLP and Rad. 
+
+Note from Bruce: However, with AnnualTempRange added, the revised regression tree has Rad and AnnualTempRange as the top two predictors
+
+```{r tree regression for amplitude}
+tree.model <- tree::tree(Amplitude ~ height +
+                 ETmp + MSLP + PET + Rad + 
+                 Rain_bc + 
+                 RH + SoilM +
+                 VP + Wind + AnnualTempRange, 
+                 data = combine.vcsn.reg)
+plot(tree.model)
+text(tree.model)
+```
+
+## Phase
+
+```{r}
+iso_plot_spatial_static(combine.data, "Site", "lat", "lon", "phase")
+```
+
+```{r plot phase versus VCSN }
+phase.long <- combine.vcsn.reg |> 
+  dplyr::select(phase, height, VCSN.lat: Wind, AnnualTempRange) |> 
+  pivot_longer(cols = -phase, names_to = "Predictor", values_to = "Value")
+
+ggplot(phase.long, aes(x = Value, y = phase)) +
+  geom_point(colour = "blue") +
+  facet_wrap(vars(Predictor), scale = "free_x")
+```
+
+
+
+```{r correlation phase with Rad and SoilM}
+corr.phase.MSLP <-   round(cor(combine.vcsn.reg$phase, combine.vcsn.reg$MSLP), 2)
+corr.phase.MSLP <- round(cor(combine.vcsn.reg$Amplitude, combine.vcsn.reg$VP), 2)
+```
+
+
+The estimated sinusoidal phase has highest correlation with the Mean Sea Level Pressure MSLP (`r corr.phase.MSLP`) and Vapour Pressure VP (`r corr.phase.MSLP`).
+
+```{r plot correlation phase vs VCSN}
+combine.vcsn.reg |> 
+  dplyr::select(phase, height, ETmp: Wind, AnnualTempRange) |> 
+  GGally::ggpairs()
+```
+
+VP and height are the two top VCSN predictors for phase
+
+```{r tree regression for phase}
+tree.model <- tree::tree(phase ~ height +
+                 ETmp + MSLP + PET + Rad + 
+                 Rain_bc + 
+                 RH + SoilM +
+                 VP + Wind + AnnualTempRange, 
+                 data = combine.vcsn.reg)
+plot(tree.model)
+text(tree.model)
+```
+
+## Offset
+
+```{r}
+iso_plot_spatial_static(combine.data, "Site", "lat", "lon", "offset")
+```
+
+```{r}
+offset.long <- combine.vcsn.reg |> 
+  dplyr::select(offset, height, VCSN.lat: Wind, AnnualTempRange) |> 
+  pivot_longer(cols = -offset, names_to = "Predictor", values_to = "Value")
+
+ggplot(offset.long, aes(x = Value, y = offset)) +
+  geom_point(colour = "blue") +
+  facet_wrap(vars(Predictor), scale = "free_x")
+```
+
+VP, AnnualTempRange, ETmp and SoilM are the best predictors for offset
+```{r tree regression for offset}
+tree.model <- tree::tree(offset ~ height +
+                 factor(island) +
+                 VCSN.lat + VCSN.lon + 
+                 ETmp + MSLP + PET + Rad + 
+                 Rain_bc + 
+                 RH + SoilM +
+                 VP + Wind + AnnualTempRange, 
+                 data = combine.vcsn.reg)
+plot(tree.model)
+text(tree.model)
+```
+
+
+
+# Second batch of regression models using VCSN data
+
+
+## First - bring in Leave-one-out cross validation as a test of model suitability
+
+```{r}
+
+ctrl <- caret::trainControl(method = "LOOCV")
+```
+
+
+## Amplitude 
+
+First try a basic model for amplitude, with and without height (elevation) as a predictor.
+In this case, the model not including height has a slightly lower RMSE (and slightly higher r squared) than the one with height. 
+
+```{r}
+model <- train(Amplitude ~ VCSN.lat + VCSN.lon + height, 
+               data = combine.vcsn.reg, 
+               method = "lm", 
+               trControl = ctrl)
+print(model)
+
+model2 <- train(Amplitude ~ VCSN.lat + VCSN.lon, 
+                data = combine.vcsn.reg, 
+                method = "lm",
+                trControl = ctrl)
+print(model2)
+
+```
+
+
+At this point we tried a range of different models. We used stepAIC to trim down models, then assessed the selected models based on LOOCV. For each of amplitude, phase, and offset we keep the model matching Allen (2018), and one other model (generally with more predictors). For brevity I have deleted the ones we chose not to keep. 
+
+Below we test the model matching that used by Allen et al. (2018) for amplitude. 
+
+Again, we use LOOCV to test the full model against the reduced one selected by stepAIC. 
+
+```{r}
+model3 <- train(Amplitude ~ VCSN.lat + VCSN.lon + height + Rain_bc + AnnualTempRange,
+                data = combine.vcsn.reg,
+                method = "lm",
+                trControl = ctrl)
+print(model3)
+
+model4<- train(Amplitude ~ VCSN.lon + height + AnnualTempRange, 
+               data = combine.vcsn.reg, 
+               method = "lm", 
+               trControl = ctrl)
+print(model4)
+
+```
+
+This is the Allen et al. method model.
+
+```{r}
+Amp.mod1.2 <- lm(Amplitude ~ VCSN.lat + VCSN.lon + height + Rain_bc + AnnualTempRange, 
+                 data = combine.vcsn.reg)
+
+Amp.mod1.2step <- MASS::stepAIC(Amp.mod1.2)
+summary(Amp.mod1.2step)
+```
+
+
+Here (for amplitude) is the 'full' model with all the less-correlated VCSN predictors plus height, lat, long and AnnualTempRange. The best model based on LOOCV is the STEPAIC-reduced model that comes from these predictors: model 6 - or A.mod1.step
+
+```{r}
+model5 <- train(Amplitude ~ height +
+                 VCSN.lat + VCSN.lon + VCSN.lat:VCSN.lon +
+                 ETmp + MSLP + PET + Rad + 
+                 Rain_bc + 
+                 RH + SoilM +
+                 VP + Wind + AnnualTempRange, 
+                data = combine.vcsn.reg, 
+                method = "lm", 
+                trControl = ctrl)
+print(model5)
+
+model6<- train(Amplitude ~ height + VCSN.lat + VCSN.lon + PET + Rad + VP + Wind, 
+    data = combine.vcsn.reg,
+    method = "lm", 
+    trControl = ctrl)
+print(model6)
+```
+
+
+```{r}
+A.mod1 <- lm(Amplitude ~  height +
+                 VCSN.lat + VCSN.lon + VCSN.lat:VCSN.lon +
+                 ETmp + MSLP + PET + Rad + 
+                 Rain_bc + 
+                 RH + SoilM +
+                 VP + Wind + AnnualTempRange,
+                 data = combine.vcsn.reg)
+
+A.mod1.step <- MASS::stepAIC(A.mod1, direction = "both", trace = FALSE)
+summary(A.mod1.step)
+car::vif(A.mod1.step)
+car::Anova(A.mod1.step)
+```
+
+
+## Phase
+
+Model matching that used by Allen et al. (2018) now applied to phase.
+
+```{r}
+model7 <- train(phase ~ VCSN.lat + VCSN.lon + height + Rain_bc + AnnualTempRange,
+                data = combine.vcsn.reg, 
+                method = "lm", 
+                trControl = ctrl)
+print(model7)
+
+model8<- train(phase ~ VCSN.lat + VCSN.lon, 
+               data = combine.vcsn.reg, 
+               method = "lm", 
+               trControl = ctrl)
+print(model8)
+```
+
+
+```{r}
+phase.mod1.2 <- lm(phase ~ VCSN.lat + VCSN.lon + height + Rain_bc + AnnualTempRange,
+                   data = combine.vcsn.reg)
+
+phase.mod1.2step <- MASS::stepAIC(phase.mod1.2)
+summary(phase.mod1.2step)
+```
+
+And again for the 'full' phase model. Model 9 includes all predictors and model 10 gives the StepAIC-reduced model.
+
+```{r}
+model9 <- train(phase ~  height +
+                 island +
+                 VCSN.lat + VCSN.lon + VCSN.lat:VCSN.lon +
+                 ETmp + MSLP + PET + Rad + 
+                 Rain_bc + 
+                 RH + SoilM +
+                 VP + Wind + AnnualTempRange, 
+                data = combine.vcsn.reg, 
+                method = "lm", trControl = ctrl)
+print(model9)
+
+model10<- train(phase ~ height +
+                 island +
+                 VCSN.lat + VCSN.lon + VCSN.lat:VCSN.lon +
+                 MSLP + Rad + SoilM +
+                 VP + Wind + AnnualTempRange, 
+                 data = combine.vcsn.reg, 
+                 method = "lm", 
+                 trControl = ctrl)
+print(model10)
+```
+
+```{r}
+phase.mod1 <- lm(phase ~  height +
+                 island +
+                 VCSN.lat + VCSN.lon + VCSN.lat:VCSN.lon +
+                 ETmp + MSLP + PET + Rad + 
+                 Rain_bc + 
+                 RH + SoilM +
+                 VP + Wind + AnnualTempRange,
+                 data = combine.vcsn.reg)
+
+phase.mod1.step <- MASS::stepAIC(phase.mod1, direction = "both", trace = FALSE)
+summary(phase.mod1.step)
+car::vif(phase.mod1.step, type = "predictor")
+car::Anova(phase.mod1.step)
+```
+
+##Offset
+
+
+Model matching that used by Allen et al. (2018) now applied to offset. First test both full and reduced models using LOOCV. 
+
+And again for the 'full' phase model. Model 9 includes all predictors and model 10 gives the StepAIC-reduced model
+
+```{r}
+model11 <- train(offset ~ VCSN.lat + VCSN.lon + height + Rain_bc + AnnualTempRange,
+                 data = combine.vcsn.reg,
+                 method = "lm", 
+                 trControl = ctrl)
+print(model11)
+
+model12<- train(offset ~ VCSN.lat + height + Rain_bc + AnnualTempRange, 
+                data = combine.vcsn.reg, 
+                method = "lm", 
+                trControl = ctrl)
+print(model12)
+```
+
+In the case below for the Allen predictors, the full model gave a slightly better LOOCV result. We'll keep that one. 
+
+```{r}
+offset.mod1.2 <- lm(offset ~ VCSN.lat + VCSN.lon + height + Rain_bc + AnnualTempRange, 
+                    data = combine.vcsn.reg)
+
+offset.mod1.2step <- MASS::stepAIC(offset.mod1.2)
+summary(offset.mod1.2step)
+```
+
+And finally the 'full' model for offset. Again the StepAIC model gives the best LOOCV result. This StepAIC model doesn't include latitude, but does include Etmp as a predictor. 
+
+```{r}
+model13 <- train(offset ~  height +
+                 island +
+                 VCSN.lat + VCSN.lon + VCSN.lat:VCSN.lon +
+                 ETmp + MSLP + PET + Rad + 
+                 Rain_bc + 
+                 RH + SoilM +
+                 VP + Wind + AnnualTempRange, data = combine.vcsn.reg, method = "lm", trControl = ctrl)
+print(model13)
+
+model14<- train(offset ~  height +
+                 island +
+                 VCSN.lon +
+                 ETmp + MSLP +
+                 Rain_bc + 
+                 RH +
+                 VP + AnnualTempRange, 
+                 data = combine.vcsn.reg, 
+                 method = "lm", 
+                 trControl = ctrl)
+print(model14)
+
+```
+
+
+Here are the models for later use. 
+
+```{r}
+offset.mod1 <- lm(offset ~  height +
+                 island +
+                 VCSN.lat + VCSN.lon + VCSN.lat:VCSN.lon +
+                 ETmp + MSLP + PET + Rad + 
+                 Rain_bc + 
+                 RH + SoilM +
+                 VP + Wind + AnnualTempRange,
+               data = combine.vcsn.reg)
+
+offset.mod1.step <- MASS::stepAIC(offset.mod1, direction = "both", trace = FALSE)
+summary(offset.mod1.step)
+car::vif(offset.mod1.step, type = "predictor")
+car::Anova(offset.mod1.step)
+```
+
+
+
+# Prediction over New Zealand 1 - linear model predictions
+
+Apply the StepAIC-selected 'full' linear models made using the measurement site results across the VCSN grid. 
+
+First amplitude. Also, set minimum amplitude limit to zero
+
+```{r}
+national.climate.summary$amp.pred <- predict(A.mod1.step, 
+                                             newdata = national.climate.summary)
+
+range(national.climate.summary$amp.pred)
+national.climate.summary$amp.pred <- pmax(national.climate.summary$amp.pred, 0)
+range(national.climate.summary$amp.pred)
+```
+
+
+Now phase and offset
+
+```{r}
+
+national.climate.summary$phase.pred<-predict(phase.mod1.step, 
+                                             newdata = national.climate.summary)
+
+range(national.climate.summary$phase.pred)
+national.climate.summary$offset.pred<-predict(offset.mod1.step, newdata = national.climate.summary)
+range(national.climate.summary$offset.pred)
+
+```
+
+Now all of the regressions following Allen et. al. (2018) for comparison later
+
+```{r}
+national.climate.summary$allen.amp.pred<-predict(Amp.mod1.2step, newdata = national.climate.summary)
+range(national.climate.summary$allen.amp.pred)
+
+national.climate.summary$allen.phase.pred<-predict(phase.mod1.2step, newdata = national.climate.summary)
+range(national.climate.summary$allen.phase.pred)
+
+national.climate.summary$allen.offset.pred<-predict(offset.mod1.2, newdata = national.climate.summary)
+range(national.climate.summary$allen.offset.pred)
+```
+
+
+# Plots of some linear model predictions 
+
+
+
+```{r}
+national.climate.summary.sf <- dplyr::full_join(national.climate.summary, 
+                                                vcsn.agent.locations1, 
+                                                by = "VCSN.Agent") |>
+                                sf::st_as_sf()
+
+plot(national.climate.summary.sf["amp.pred"], cex = 0.5, pch = 16)
+plot(national.climate.summary.sf["allen.amp.pred"], cex = 0.5, pch = 16)
+plot(national.climate.summary.sf["offset.pred"], cex = 0.5, pch = 16)
+
+```
+# Calculation of residuals for 6 linear models
+
+
+
+First, apply the national linear model predictions to the measurement sites only. 
+
+```{r}
+combine.vcsn.reg$amp.pred<-predict(A.mod1.step, newdata = combine.vcsn.reg)
+combine.vcsn.reg$phase.pred<-predict(phase.mod1.step, newdata = combine.vcsn.reg)
+combine.vcsn.reg$offset.pred<-predict(offset.mod1.step, newdata = combine.vcsn.reg)
+
+combine.vcsn.reg$allen.amp.pred<-predict(Amp.mod1.2step, newdata = combine.vcsn.reg)
+combine.vcsn.reg$allen.phase.pred<-predict(phase.mod1.2step, newdata = combine.vcsn.reg)
+combine.vcsn.reg$allen.offset.pred<-predict(offset.mod1.2step, newdata = combine.vcsn.reg)
+```
+
+
+Then, calculate residuals for the various 'complete' models 
+
+```{r}
+combine.vcsn.reg$amp.pred.err<- combine.vcsn.reg$amp.pred - combine.vcsn.reg$Amplitude
+combine.vcsn.reg$phase.pred.err<- combine.vcsn.reg$phase.pred - combine.vcsn.reg$phase
+combine.vcsn.reg$offset.pred.err<- combine.vcsn.reg$offset.pred - combine.vcsn.reg$offset
+
+combine.vcsn.reg$allen.amp.pred.err<- combine.vcsn.reg$allen.amp.pred - combine.vcsn.reg$Amplitude
+combine.vcsn.reg$allen.phase.pred.err<- combine.vcsn.reg$allen.phase.pred - combine.vcsn.reg$phase
+combine.vcsn.reg$allen.offset.pred.err<- combine.vcsn.reg$allen.offset.pred - combine.vcsn.reg$offset
+```
+
+
+#Mapping residuals for linear model predictions
+
+Make regression summary by site data frame into an sf object. 
+
+```{r}
+site.regression.summary.sf <- combine.vcsn.reg |> 
+  sf::st_as_sf(coords = c("VCSN.lon", "VCSN.lat"), crs = 4326)
+```
+
+```{r nzmap sf object}
+nzmap <- rnaturalearth::ne_countries(scale = 'large', 
+                      country = "New Zealand",
+                      returnclass = 'sf')
+```
+
+
+```{r plot amplitude residuals with NZ map}
+ggplot() + 
+    geom_sf(data = nzmap, fill = "tan1") + 
+    geom_sf(data = site.regression.summary.sf,
+            mapping = aes(size = amp.pred.err, colour = Amplitude)) +
+    coord_sf(xlim = c(164.8, 179.4), ylim = c(-47.7, -33.8)) +
+    scale_colour_viridis_c() +
+    xlab("Longitude") +
+    ylab("Latitude") +
+    ggtitle("Linear model amplitude residuals")
+
+ggplot() + 
+    geom_sf(data = nzmap, fill = "tan1") + 
+    geom_sf(data = site.regression.summary.sf,
+            mapping = aes(size = allen.amp.pred.err, colour = Amplitude)) +
+    coord_sf(xlim = c(164.8, 179.4), ylim = c(-47.7, -33.8)) +
+    scale_colour_viridis_c() +
+    xlab("Longitude") +
+    ylab("Latitude") +
+    ggtitle("Linear model amplitude residuals (Allen method)")
+
+ggplot() + 
+    geom_sf(data = nzmap, fill = "tan1") + 
+    geom_sf(data = site.regression.summary.sf,
+            mapping = aes(size = phase.pred.err, colour = phase)) +
+    coord_sf(xlim = c(164.8, 179.4), ylim = c(-47.7, -33.8)) +
+    scale_colour_viridis_c() +
+    xlab("Longitude") +
+    ylab("Latitude") +
+    ggtitle("Linear model phase residuals")
+
+ggplot() + 
+    geom_sf(data = nzmap, fill = "tan1") + 
+    geom_sf(data = site.regression.summary.sf,
+            mapping = aes(size = allen.phase.pred.err, colour = phase)) +
+    coord_sf(xlim = c(164.8, 179.4), ylim = c(-47.7, -33.8)) +
+    scale_colour_viridis_c() +
+    xlab("Longitude") +
+    ylab("Latitude") +
+    ggtitle("Linear model phase residuals (Allen method)")
+
+ggplot() + 
+    geom_sf(data = nzmap, fill = "tan1") + 
+    geom_sf(data = site.regression.summary.sf,
+            mapping = aes(size = offset.pred.err, colour = offset)) +
+    coord_sf(xlim = c(164.8, 179.4), ylim = c(-47.7, -33.8)) +
+    scale_colour_viridis_c() +
+    xlab("Longitude") +
+    ylab("Latitude") +
+    ggtitle("Linear model offset residuals")
+
+ggplot() + 
+    geom_sf(data = nzmap, fill = "tan1") + 
+    geom_sf(data = site.regression.summary.sf,
+            mapping = aes(size = allen.offset.pred.err, colour = offset)) +
+    coord_sf(xlim = c(164.8, 179.4), ylim = c(-47.7, -33.8)) +
+    scale_colour_viridis_c() +
+    xlab("Longitude") +
+    ylab("Latitude") +
+    ggtitle("Linear model offset residuals (Allen method)")
+```
+
+
+
+
+# Linear model of amplitude resisduals from Allen model for regression kriging
+
+Make model, attach it to national grid and plot
+
+```{r}
+amp.residuals.mod1 <- lm(allen.amp.pred.err ~  island + ETmp + MSLP + PET + Rad + 
+                 RH + SoilM + VP + Wind,
+               data = combine.vcsn.reg)
+
+amp.residuals.mod1.step <- MASS::stepAIC(amp.residuals.mod1, direction = "both", trace = FALSE)
+summary(amp.residuals.mod1.step)
+car::vif(amp.residuals.mod1.step, type = "predictor")
+car::Anova(amp.residuals.mod1.step)
+national.climate.summary.sf$amp.err.pred<-predict(amp.residuals.mod1, newdata = national.climate.summary)
+plot(national.climate.summary.sf["amp.err.pred"], cex = 0.5, pch = 16)
+```
+
+
+
+# Saved data
+
+## Site summary for estimated sinusoidal parameters
+
+```{r}
+save(combine.data, file = "Output/Data/combine.data.RData")
+dim(combine.data)     
+names(combine.data)
+```
+
+## Site summary for estimated sinusoidal parameters and predicted values from regressions
+
+```{r}
+save(combine.vcsn.reg, file = "Output/Data/combine.vcsn.reg.RData")
+dim(combine.vcsn.reg)     
+names(combine.vcsn.reg)
+
+save(national.climate.summary, file = "Output/Data/national.climate.summary.01.output.RData")
+dim(national.climate.summary)     
+names(national.climate.summary)
+```
+
+## RMSE by site
+
+```{r}
+save(RMSE.by.site, file = "Output/Data/RMSE.by.site.RData")
+dim(RMSE.by.site)     
+names(RMSE.by.site)
+```

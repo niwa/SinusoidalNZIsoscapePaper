@@ -1,0 +1,931 @@
+---
+title: "Precipitation sinusoidal isocape model: kriging over NZ of sinusoidal parameters"
+author: "Bruce Dudley (NIWA), Andy Mckenzie (NIWA)"
+date: "`r format(Sys.Date(), '%d %B, %Y')`"
+output:
+  html_document: 
+    theme: united
+    code_folding: show
+    toc: yes
+    toc_float:
+      collapsed: true   
+    fig_caption: yes
+    number_sections: yes
+    df_print: kable
+  word_document: 
+    toc: yes
+  pdf_document: 
+    toc: yes
+    fig_caption: yes
+    number_sections: yes
+editor_options:
+  chunk_output_type: console
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+# Global options
+#
+# echo = TRUE. Show the code
+# comment = "". Don't put anything in front of results from code
+# warning = FALSE. Don't display warning messages
+# cache = TRUE. Only process new code when you knit
+# dev = 'png'. Save graphics in figure folder as png
+# fig.height = 5. Height of figures (in inches)
+
+unlink("Output/MonthlyResiduals", recursive = TRUE)
+dir.create("Output/MonthlyResiduals")
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  comment = "",
+  warning = FALSE,
+  message = FALSE,
+  cache = TRUE,
+  dev = "png", dpi = 300,
+  fig.height = 5
+)
+
+
+# tidyverse packages
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(readr)
+library(stringr)  # for str_replace() function
+
+
+# https://docs.stadiamaps.com/guides/migrating-from-stamen-map-tiles/#ggmap
+# devtools::install_github("stadiamaps/ggmap”)
+library(ggmap) # get_stamenmap() & ggmap
+# register_stadiamaps("ff428357-71cc-4a08-8912-9111113265ec", write = TRUE)
+
+
+# For map plotting
+library(sf)
+library(stars)
+
+# devtools::install_github("ropensci/rnaturalearthhires")
+library(rnaturalearthhires)
+library(rnaturalearth)
+library(rnaturalearthdata)
+
+library(ggrepel) # geom_text_repel()
+library(cowplot) # multiple plots for a figure
+
+# model kriging
+library(gstat)
+
+rm(list = ls())
+
+source("auxiliary.code.R")
+
+ft <- function(input.data, caption = "", num.rows = Inf) {
+  ft <- input.data |>
+    slice_head(n = num.rows) |>
+    flextable() |>
+    autofit() |>
+    theme_zebra() |>
+    set_caption(caption)
+  ft
+}
+```
+
+
+# Load in data
+
+## Mean value climate data and predicted sinusoidal parameters
+
+
+```{r}
+# Mean value of climate data at an agent location, with appended columns for predicted value
+#  - output from 02-isoscape-kriging-sinusoidal-parameters.Rmd
+#  - load R object has name  "national.climate.summary"
+load(file = "Output/Data/national.climate.summary.02.output.RData")
+dim(national.climate.summary)
+names(national.climate.summary)
+```
+
+## The d18O observed values 
+
+```{r}
+load(file = "Output/Data/ddata.RData")
+glimpse(ddata)
+```
+
+## VCSN agent locations
+
+```{r}
+load(file = "Output/Data/vcsn.agent.locations.RData")
+glimpse(vcsn.agent.locations)
+```
+
+```{r}
+load(file = "Output/Data/vcsn.agent.locations1.RData")
+glimpse(vcsn.agent.locations1)
+```
+
+## VCSN climate means at all agent locations
+
+```{r}
+load(file = "Output/Data/vcsn.mean.RData")
+dim(vcsn.mean)
+names(vcsn.mean)
+```
+
+## NZ grid for interpolating over
+
+```{r}
+load(file = "Output/Data/nzgrid.long.format.RData")
+glimpse(nzgrid.long.format)
+```
+
+## Estimated sinusoidal parameters at sites, mean VCSN values, Allen predicted sinusoidal parameters 
+
+```{r}
+load(file = "Output/Data/combine.vcsn.reg.RData")
+dim(combine.vcsn.reg)
+names(combine.vcsn.reg)
+```
+
+## RMSE by site
+
+```{r}
+load(file = "Output/Data/RMSE.by.site.RData")
+dim(RMSE.by.site)
+names(RMSE.by.site)
+```
+
+## VCSN data
+
+```{r cache=FALSE}
+# cache = FALSE, as problems otherwise with large R object
+load("ProcessedData/vcsn.2007.2022.RData")
+glimpse(vcsn.2007.2022)
+
+# Used latter in the code
+vcsn.2007.2022cut <- vcsn.2007.2022[, c(1:4, 16)]
+
+rm(vcsn.2007.2022)
+```
+
+
+# Calculate monthly d18O values from amplitude, phase and offset maps
+
+
+## Append prediction columns for linear, Allen, and kriging models
+
+```{r monthly predictions of d18O nationally}
+# note that this clunky code is Bruce's doing
+
+# collection on 15th of each month
+julian.day.month.midpoints <- c(15, 46, 74, 105, 135, 166, 196, 227, 258, 288, 319, 349)
+julian.days <- julian.day.month.midpoints / 365
+julian.days
+
+
+linear.model.18O.pred <- data.frame(
+  amplitude = national.climate.summary$amp.pred, # Create dataframe
+  phase = national.climate.summary$phase.pred,
+  offset = national.climate.summary$offset.pred,
+  VCSN.Agent = national.climate.summary$VCSN.Agent
+)
+
+Allen.model.18O.pred <- data.frame(
+  amplitude = national.climate.summary$allen.amp.pred, # Create dataframe
+  phase = national.climate.summary$allen.phase.pred,
+  offset = national.climate.summary$allen.offset.pred,
+  VCSN.Agent = national.climate.summary$VCSN.Agent
+)
+
+Krig.model.18O.pred <- data.frame(
+  amplitude = national.climate.summary$krig.amp.pred, # Create dataframe
+  phase = national.climate.summary$krig.phase.pred,
+  offset = national.climate.summary$krig.offset.pred,
+  VCSN.Agent = national.climate.summary$VCSN.Agent
+)
+
+
+# Function to predict 18O for linear model
+
+calc_precip_isotope <- function(julian.fraction) {
+  linear.model.18O.pred$amplitude * (sin(2 * pi * julian.fraction) - linear.model.18O.pred$phase) + linear.model.18O.pred$offset
+}
+
+calc_precip_isotope2 <- function(julian.fraction) {
+  Allen.model.18O.pred$amplitude * (sin(2 * pi * julian.fraction) - Allen.model.18O.pred$phase) + Allen.model.18O.pred$offset
+}
+
+calc_precip_isotope3 <- function(julian.fraction) {
+  Krig.model.18O.pred$amplitude * (sin(2 * pi * julian.fraction) - Krig.model.18O.pred$phase) + Krig.model.18O.pred$offset
+}
+
+# loop for rolling it through months and appending columns
+
+for (i in julian.days) {
+  # Create new column of d18O predictions  
+  new <- calc_precip_isotope(i) 
+  # Append new column  
+  linear.model.18O.pred[, ncol(linear.model.18O.pred) + 1] <- new 
+  colnames(linear.model.18O.pred)[ncol(linear.model.18O.pred)] <- paste0("new", i) # Rename column name
+}
+
+for (i in julian.days) {
+  new <- calc_precip_isotope2(i) # Create new column of d18O predictions
+  Allen.model.18O.pred[, ncol(Allen.model.18O.pred) + 1] <- new # Append new column
+  colnames(Allen.model.18O.pred)[ncol(Allen.model.18O.pred)] <- paste0("new", i) # Rename column name
+}
+
+for (i in julian.days) {
+  new <- calc_precip_isotope3(i) # Create new column of d18O predictions
+  Krig.model.18O.pred[, ncol(Krig.model.18O.pred) + 1] <- new # Append new column
+  colnames(Krig.model.18O.pred)[ncol(Krig.model.18O.pred)] <- paste0("new", i) # Rename column name
+}
+
+
+names(linear.model.18O.pred) <- c("amplitude", "phase", "offset", "VCSN.Agent", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12")
+
+names(Allen.model.18O.pred) <- c("amplitude", "phase", "offset", "VCSN.Agent", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12")
+
+names(Krig.model.18O.pred) <- c("amplitude", "phase", "offset", "VCSN.Agent", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12")
+
+head(linear.model.18O.pred)
+linear.model.18O.long <- gather(linear.model.18O.pred, month, d18O, as.character(1:12), factor_key = TRUE)
+Allen.model.18O.long <- gather(Allen.model.18O.pred, month, d18O, as.character(1:12), factor_key = TRUE)
+Krig.model.18O.long <- gather(Krig.model.18O.pred, month, d18O, as.character(1:12), factor_key = TRUE)
+
+
+head(linear.model.18O.long)
+head(Allen.model.18O.long)
+head(Krig.model.18O.long)
+
+linear.model.18O.long$VCSN.Agent <- as.character(linear.model.18O.long$VCSN.Agent)
+linear.model.18O.long$month <- as.character(linear.model.18O.long$month)
+Allen.model.18O.long$VCSN.Agent <- as.character(Allen.model.18O.long$VCSN.Agent)
+Allen.model.18O.long$month <- as.character(Allen.model.18O.long$month)
+Krig.model.18O.long$VCSN.Agent <- as.character(Krig.model.18O.long$VCSN.Agent)
+Krig.model.18O.long$month <- as.character(Krig.model.18O.long$month)
+
+linear.model.18O.long <- linear.model.18O.long[, 4:6]
+Allen.model.18O.long <- Allen.model.18O.long[, 4:6]
+Krig.model.18O.long <- Krig.model.18O.long[, 4:6]
+
+names(linear.model.18O.long) <- c("VCSN.Agent", "month", "d18O.lin")
+names(Allen.model.18O.long) <- c("VCSN.Agent", "month", "d18O.Allen")
+names(Krig.model.18O.long) <- c("VCSN.Agent", "month", "d18O.krig")
+```
+
+Make an 'uncorrected' file for later testing against corrected isoscapes
+
+```{r}
+unco.frame<-linear.model.18O.long
+unco.frame$unco.Allen<-Allen.model.18O.long$d18O.Allen
+unco.frame$unco.krig<-Krig.model.18O.long$d18O.krig
+colnames(unco.frame)[3] <-"unco.lin"
+head(unco.frame)
+```
+
+
+## Comparison of modelled and measured data
+
+First make a version of the original data file with month-of-the-year means for each measurement site. This is for comparison to and correction of the models.
+
+```{r monthly average values from measurement sites}
+meandata <- ddata |>
+  dplyr::select(month, d18O, agent.number) |> # select the named columns
+  group_by(month, agent.number) |> # group by site and npid
+  dplyr::summarise(value = mean(d18O)) |> # calculate mean values
+  ungroup() |> # ungroup
+  na.omit()
+names(meandata) <- c("month", "VCSN.Agent", "d18O.measured")
+```
+
+Then glue the predictions for each of the three methods to this data frame. 
+
+```{r}
+meandata$month <- as.character(meandata$month)
+meandata$VCSN.Agent <- as.character(meandata$VCSN.Agent)
+joindata1 <- left_join(meandata, linear.model.18O.long,
+                       by = c("month" = "month", "VCSN.Agent" = "VCSN.Agent"))
+joindata2 <- left_join(joindata1, Allen.model.18O.long,
+                       by = c("month" = "month", "VCSN.Agent" = "VCSN.Agent"))
+joindata3 <- left_join(joindata2, Krig.model.18O.long, 
+                       by = c("month" = "month", "VCSN.Agent" = "VCSN.Agent"))
+rm(joindata1)
+rm(joindata2)
+```
+
+
+```{r}
+resids.frame <- data.frame(
+  month = joindata3$month,
+  VCSN.Agent = joindata3$VCSN.Agent,
+  lin.resid = (joindata3$d18O.lin - joindata3$d18O.measured),
+  Allen.resid = (joindata3$d18O.Allen - joindata3$d18O.measured),
+  Krig.resid = (joindata3$d18O.krig - joindata3$d18O.measured)
+)
+
+vcsn.agent.locations1$VCSN.Agent <- as.character(vcsn.agent.locations1$VCSN.Agent)
+resids.frame <- left_join(resids.frame, vcsn.agent.locations1, by = c("VCSN.Agent" = "VCSN.Agent"))
+vcsn.mean$Agent <- as.character(vcsn.mean$Agent)
+resids.frame <- left_join(resids.frame, vcsn.mean, by = c("VCSN.Agent" = "Agent"))
+resids.frame <- resids.frame[, c(1:8, 11:21)]
+```
+
+
+Next, create residuals map for a single model*month combination. 
+Then apply this as a correction to the models at the full VCSN scale. 
+Then loop it through the other 35 month*model combinations!
+
+
+## Warm-up residual map for a single model and month combindation
+
+```{r}
+test.dataset<-dplyr::filter(resids.frame, month == "12")
+```
+
+```{r test data to sf format}
+# NZTM
+crs_projected_target <- "EPSG:2193"
+
+test.dataset.proj <- st_as_sf(test.dataset,
+  coords = c("vcsn.lon", "vcsn.lat"),
+  remove = FALSE,
+  crs = 4326
+) |>
+  st_transform(crs = crs_projected_target) 
+```
+
+
+```{r}
+resid.trend <- gstat::variogram(lin.resid ~ Rain_bc + ETmp, test.dataset.proj)
+lin.resid.trend.model <- gstat::fit.variogram(resid.trend, vgm(model = "Exp"))
+
+plot(resid.trend, lin.resid.trend.model, plot.numbers = TRUE)
+save(lin.resid.trend.model, file = "Output/MonthlyResiduals/lin.resid.trend.model.RData")
+```
+
+
+Apply residual trend kriging model over NZ. 
+
+```{r}
+lin.resid.krig.trend <- gstat::krige(lin.resid ~ Rain_bc + ETmp, 
+                           test.dataset.proj, 
+                           nzgrid.long.format, 
+                           lin.resid.trend.model)
+save(lin.resid.krig.trend, file = "Output/MonthlyResiduals/lin.resid.krig.trend.RData")
+```
+
+and plot the residuals for fun
+
+```{r}
+
+lin.resid.krig.trend.stars <- stars::st_as_stars(lin.resid.krig.trend)
+
+plot.lin.resid.krig.trend <- 
+  ggplot() + 
+    geom_stars(data = lin.resid.krig.trend.stars, aes(fill = var1.pred)) + 
+    geom_sf(data = test.dataset.proj) +
+    coord_sf(expand = FALSE) +
+    scale_fill_continuous(type = "viridis") +
+    labs(fill = "18O residual") +  
+    xlab("Longitude") +
+    ylab("Latitude") +
+    ggtitle("December residuals: regression kriging interpolation") 
+
+plot.lin.resid.krig.trend
+```
+
+compare with ordinary kriging 
+
+
+```{r}
+resid.trend2  <- gstat::variogram(lin.resid ~ 1, test.dataset.proj)
+
+resid.trend2.model <- gstat::fit.variogram(resid.trend2, vgm(model = "Exp"))
+plot(resid.trend2, resid.trend2.model, plot.numbers = TRUE)
+```
+
+Apply constant kriging model over NZ. 
+
+```{r constant model kriging offset}
+krig.constant.resid <- gstat::krige(lin.resid ~ 1, 
+                           test.dataset.proj, 
+                           nzgrid.long.format, 
+                           resid.trend2.model)
+```
+
+Plot the ordinary kriging model
+
+```{r}
+
+krig.constant.resid.stars <- stars::st_as_stars(krig.constant.resid)
+
+plot.krig.constant.resid <- 
+ggplot() + 
+  geom_stars(data = krig.constant.resid.stars, aes(fill = var1.pred)) + 
+  geom_sf(data = test.dataset.proj) +
+  coord_sf(expand = FALSE) +
+  scale_fill_continuous(type = "viridis") +
+  labs(fill = "18O residual") +  
+  xlab("Longitude") +
+  ylab("Latitude") +
+  ggtitle("December residuals: ordinary kriging interpolation") 
+
+plot.krig.constant.resid
+```
+
+## Residual map for all model and month combindation
+
+
+Both of the efforts above look a bit useless. Do some exploratory regressions to see if
+there is a more useful predictor of residuals for this model. ETmp, and a combination of
+ETmp and SoilM look generally good. 
+
+```{r}
+head(resids.frame)
+```
+
+First loop through the monthly linear model residuals 
+
+```{r loop through months to make a national residuals dataframe based on universal kriging}
+# NZTM
+crs_projected_target <- "EPSG:2193"
+
+resids.frame.proj <- st_as_sf(resids.frame,
+  coords = c("vcsn.lon", "vcsn.lat"),
+  remove = FALSE,
+  crs = 4326
+) |>
+  st_transform(crs = crs_projected_target)
+
+monthly <- unique(resids.frame.proj$month)
+
+for (mth in monthly) {
+  resids.frame1 <- resids.frame.proj[resids.frame.proj$month == mth, ]
+  resid.trend   <- gstat::variogram(lin.resid ~ ETmp + SoilM, resids.frame1)
+  trend.model   <- gstat::fit.variogram(resid.trend, vgm(model = "Exp"))
+  krig.trend    <- gstat::krige(
+    lin.resid ~ ETmp + SoilM,
+    resids.frame1,
+    nzgrid.long.format,
+    trend.model
+  )
+  agent.CRS <- sf::st_crs(vcsn.agent.locations1)
+  krig.trend.sf <- krig.trend |> sf::st_transform(crs = agent.CRS)
+  kriging.row.index1 <- sf::st_nearest_feature(vcsn.agent.locations, krig.trend.sf)
+  # Make a new column of residuals
+  new <- krig.trend.sf$var1.pred[kriging.row.index1] 
+  # Append new column   
+  vcsn.agent.locations1[, ncol(vcsn.agent.locations1) + 1] <- new 
+  # Rename column name  
+  colnames(vcsn.agent.locations1)[ncol(vcsn.agent.locations1)] <- paste0("lin.resids.", mth) 
+}
+
+save(vcsn.agent.locations1, file = "Output/MonthlyResiduals/final.residuals.data.RData")
+```
+
+Check on column names after doing the appending of new columns. 
+
+
+```{r}
+head(vcsn.agent.locations1)
+```
+
+Second and third loop through, adding as new monthly columns, correction layers for the 
+Allen and Universal kriging approaches.
+
+
+```{r loop over months Allen and kriging residuals}
+# For Allen residuals
+for (mth in monthly) {
+  resids.frame1 <- resids.frame.proj[resids.frame.proj$month == mth, ]
+  resid.trend <- gstat::variogram(Allen.resid ~ ETmp+SoilM, resids.frame1)
+  trend.model <- gstat::fit.variogram(resid.trend, vgm(model = "Exp"))
+  krig.trend  <- gstat::krige(Allen.resid ~ ETmp+SoilM, 
+                           resids.frame1, 
+                           nzgrid.long.format, 
+                           trend.model)
+  agent.CRS <- sf::st_crs(vcsn.agent.locations1)
+  krig.trend.sf <- krig.trend |>  sf::st_transform(crs = agent.CRS)
+  kriging.row.index1 <- sf::st_nearest_feature(vcsn.agent.locations, krig.trend.sf)
+ # Make a new column of residuals   
+  new <- krig.trend.sf$var1.pred[kriging.row.index1]  
+   # Append new column
+  vcsn.agent.locations1[ , ncol(vcsn.agent.locations1) + 1] <- new 
+  # Rename column name and include month
+  colnames(vcsn.agent.locations1)[ncol(vcsn.agent.locations1)] <- paste0("Allen.resids.", mth)  
+}
+
+# For kriging residuals
+for (mth in monthly) {
+  resids.frame1 <- resids.frame.proj[resids.frame.proj$month == mth, ]
+  resid.trend <- gstat::variogram(Krig.resid ~ ETmp+SoilM, resids.frame1)
+  trend.model <- gstat::fit.variogram(resid.trend, vgm(model = "Exp"))
+  krig.trend <-  gstat::krige(Krig.resid ~ ETmp+SoilM, 
+                           resids.frame1, 
+                           nzgrid.long.format, 
+                           trend.model)
+  agent.CRS <- sf::st_crs(vcsn.agent.locations1)
+  krig.trend.sf <- krig.trend |>  sf::st_transform(crs = agent.CRS)
+  kriging.row.index1 <- sf::st_nearest_feature(vcsn.agent.locations, krig.trend.sf)
+ # Make a new column of residuals   
+  new <- krig.trend.sf$var1.pred[kriging.row.index1] 
+  # Append new column  
+  vcsn.agent.locations1[ , ncol(vcsn.agent.locations1) + 1] <- new  
+ # Rename column name and include month
+  colnames(vcsn.agent.locations1)[ncol(vcsn.agent.locations1)] <- paste0("Krig.resids.", mth) 
+}
+
+save(vcsn.agent.locations1, file = "Output/MonthlyResiduals/finalfinal.residuals.data.RData")
+```
+
+
+
+# Make final monthly isoscapes
+
+
+
+## Full linear model isoscape with kriging correction
+
+```{r}
+# CHECK
+# Order for months is 1, 10, 11, 12, 2, 3, ..., 9
+# select not needed, as these are the only three columns
+# No rows removed by na.omit()
+fatlin18Oframe <- linear.model.18O.long |>
+  dplyr::select(VCSN.Agent, month, d18O.lin) |> # select the named columns
+  spread(month, d18O.lin) |> # convert from long to wide format
+  ungroup() |> # ungroup
+  na.omit()
+
+# Only 16 columns in vcsn.agent.locations1
+linresids <- vcsn.agent.locations1[, c(1:16)]
+linsubtract <- dplyr::left_join(linresids, fatlin18Oframe, by = "VCSN.Agent")
+linsubtract <- linsubtract[, c(1:17, 21:28, 18:20)]
+linsubtract <- as.data.frame(linsubtract)
+
+chop1 <- linsubtract[, 17:28]
+chop2 <- linsubtract[, 5:16]
+chop3 <- chop1 - chop2
+
+linmodelfinal <- cbind((vcsn.agent.locations1[, c(1:4)]), chop3)
+linmodel.df <- as.data.frame(linmodelfinal)
+linmodel.df <- linmodel.df[, c(1:3, 16, 4:15)]
+linmodel.df <- gather(linmodel.df, month, "lin18O", 5:16, factor_key = TRUE)
+linmodel.df$month <- stringr::str_replace(linmodel.df$month, "X", "")
+#rm(chop1, chop2, chop3)  
+```
+
+
+## Allen et al. 2018 sinusoidal isoscape with kriging correction
+
+```{r}
+fatAllen18Oframe <- Allen.model.18O.long |>                                                     
+  dplyr::select(VCSN.Agent, month,  d18O.Allen) |>   # select the named columns
+  spread(month, d18O.Allen) |>   # convert from long to wide format
+  dplyr::ungroup() |>  
+  na.omit()   
+
+Allenresids<-vcsn.agent.locations1[,c(1:4, 17:28)]
+Allensubtract<-dplyr::left_join(Allenresids,fatAllen18Oframe,  by = "VCSN.Agent")
+Allensubtract<-Allensubtract[,c(1:17,21:28,18:20)]
+Allensubtract<-as.data.frame(Allensubtract)
+chop1<-Allensubtract[,17:28]
+chop2<-Allensubtract[,5:16]
+chop3<-chop1-chop2
+Allenmodelfinal<-cbind((vcsn.agent.locations1[,c(1:4)]), chop3)
+Allenmodel.df<-as.data.frame(Allenmodelfinal)
+Allenmodel.df<-Allenmodel.df[,c(1:3,16,4:15)]
+Allenmodel.df <- gather(Allenmodel.df, month, "Allen18O", 5:16, factor_key=TRUE)
+Allenmodel.df$month <- stringr::str_replace(Allenmodel.df$month, "X", "")  
+rm(Allenresids, Allensubtract, chop1, chop2, chop3)  
+```
+
+
+## Kriging model isoscape with second kriging correction 
+ 
+```{r}
+fatKrig18Oframe <- Krig.model.18O.long |>                                                     
+  dplyr::select(VCSN.Agent, month,  d18O.krig) |>     # select the named columns
+  spread(month, d18O.krig) |>    # convert from long to wide format
+  ungroup() |>   # ungroup
+  na.omit()   
+
+Krigresids<-vcsn.agent.locations1[,c(1:4, 29:40)]
+Krigsubtract<-dplyr::left_join(Krigresids,fatKrig18Oframe,  by = "VCSN.Agent")
+Krigsubtract<-Krigsubtract[,c(1:17,21:28,18:20)]
+Krigsubtract<-as.data.frame(Krigsubtract)
+
+chop1<-Krigsubtract[,17:28]
+chop2<-Krigsubtract[,5:16]
+chop3<-chop1-chop2
+
+Krigmodelfinal<-cbind((vcsn.agent.locations1[,c(1:4)]), chop3)
+Krigmodel.df<-as.data.frame(Krigmodelfinal)
+Krigmodel.df<-Krigmodel.df[,c(1:3,16,4:15)]
+Krigmodel.df <- gather(Krigmodel.df, month, "Krig18O", 5:16, factor_key=TRUE)
+Krigmodel.df$month <- stringr::str_replace(Krigmodel.df$month, "X", "") 
+
+rm(Krigresids, Krigsubtract, chop1, chop2, chop3)  
+``` 
+
+
+# Put all model results together in dataframes for comparison
+
+
+## All models plus Baisden model predictions for VCSN points
+
+First make a 'full VCSN' data frame including mean annual predictions from the Baisden dataset and our three models. We will check the performance of the three models before and after correction. 
+
+```{r}
+load("data/VCSN_Rain_H_O_D.RData")
+Baisden <- HOD |> dplyr::select(Agent, Year, Mon,d18O) |>
+rename(Baisden18O = d18O, year = Year, VCSN.Agent = Agent, month = Mon)
+head(Baisden)
+meanBaisden<-Baisden |> group_by(VCSN.Agent, month) |>
+  summarise(mean = mean(Baisden18O))  
+
+names(meanBaisden)<-c("VCSN.Agent", "month", "Baisden18O")
+```
+
+```{r}
+First1<-linmodel.df
+First1$Allen18O<-Allenmodel.df$Allen18O
+First1$Krig18O<-Krigmodel.df$Krig18O
+head(First1)
+
+First1$month<-as.integer(First1$month)
+meanBaisden$VCSN.Agent<-as.character(meanBaisden$VCSN.Agent)
+modeldata<-left_join(First1, meanBaisden, by=c('month'='month', 'VCSN.Agent' = 'VCSN.Agent'))
+modeldata$unco.lin<-unco.frame$unco.lin
+modeldata[c('unco.lin', 'unco.Allen', 'unco.krig')] <- unco.frame[,3:5]
+
+rm(First1)
+head(modeldata)
+
+
+```
+
+## Add Bowen and Revenaugh global model predictions for New Zealand
+
+Add to this predictions from the global model of Bowen and Revenaugh (2003). Downloaded from https://wateriso.utah.edu/waterisotopes/pages/data_access/ArcGrids.html
+
+First a test
+
+```{r}
+
+myfiles <- list.files(path = "data/GlobalModelBowenRevenaugh", pattern="*.tif")
+rasta <- read_stars(paste0("data/GlobalModelBowenRevenaugh/", myfiles[1]))
+                           
+sf=sf::st_as_sf(rasta, as_points = TRUE, crs = 4326)
+
+modeldata.sf<-modeldata|> 
+  sf::st_as_sf(coords = c("vcsn.lon", "vcsn.lat"), crs = 4326)
+
+oxy<-as.data.frame(sf)
+locs<-sfheaders::sf_to_df(sf)[c("x", "y")]
+oxy$d18O<-oxy$d18o_01.tif
+oxy$lat<-locs$x
+oxy$lon<-locs$y
+oxy<-oxy[,3:5]
+oxy.sf<-oxy|> 
+  sf::st_as_sf(coords = c("lat", "lon"), crs = 4326)
+
+dim(oxy.sf)
+
+oxy.sf <- oxy.sf |> 
+  st_crop(xmin = 164.8, xmax = 179.4, ymin = -47.7, ymax = -33.8) |> 
+  st_transform(crs = 4326)
+
+dim(oxy.sf)
+
+nz_global_sf<-vcsn.agent.locations |> cbind(oxy.sf[st_nearest_feature(vcsn.agent.locations,oxy.sf),])
+rownames(nz_global_sf)<-NULL
+nz_global<-as.data.frame(nz_global_sf[,1:5])
+
+plot(nz_global_sf["d18O"], cex = 0.5, pch = 16)
+```
+
+
+Then a loop to make a data frame
+
+```{r}
+
+nz_global_full<-nz_global[,1:3]
+for (file in myfiles) {
+
+rasta <- read_stars(paste0("data/GlobalModelBowenRevenaugh/", file))
+sf=sf::st_as_sf(rasta, as_points = TRUE, crs = 4326)
+
+modeldata.sf<-modeldata|> 
+  sf::st_as_sf(coords = c("vcsn.lon", "vcsn.lat"), crs = 4326)
+
+oxy<-as.data.frame(sf)
+locs<-sfheaders::sf_to_df(sf)[c("x", "y")]
+oxy$d18O<-oxy[,1]
+oxy$lat<-locs$x
+oxy$lon<-locs$y
+oxy<-oxy[,3:5]
+
+oxy.sf<-oxy|> 
+  sf::st_as_sf(coords = c("lat", "lon"), crs = 4326)
+
+dim(oxy.sf)
+
+oxy.sf <- oxy.sf |> 
+  st_crop(xmin = 164.8, xmax = 179.4, ymin = -47.7, ymax = -33.8) |> 
+  st_transform(crs = 4326)
+
+dim(oxy.sf)
+
+nz_global_sf<-vcsn.agent.locations |> cbind(oxy.sf[st_nearest_feature(vcsn.agent.locations,oxy.sf),])
+
+rownames(nz_global_sf)<-NULL
+nz_global<-as.data.frame(nz_global_sf[,1:5])
+  new <- nz_global$d18O  # Create new column of d18O preditions
+  nz_global_full[ , ncol(nz_global_full) + 1] <- new                  # Append new column
+  colnames(nz_global_full)[ncol(nz_global_full)] <- paste0("new", file)  # Rename column name
+  print(paste0("finished ", file))
+}
+
+head(nz_global_full)
+
+```
+  
+From the chunk above, we make two dataframes to attach to the others. The first includes the global model predictions for each month, the second only has the VCSN points and the mean average isotope value of precipitation. 
+
+```{r}
+nz_global_month<-nz_global_full[,c(1,4:15)]
+nz_global_annual<-nz_global_full[,c(1,16)]
+names(nz_global_month)<-c("Agent", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12")
+names(nz_global_annual)<-c("VCSN.Agent", "O18global.model")
+nz_global_month<- gather(nz_global_month, month, "global18O", 2:13, factor_key=TRUE)
+```
+Attach to monthly data frame
+
+```{r}
+modeldata$global18O<-nz_global_month$global18O
+```
+
+Add mean monthly precipitation
+
+```{r cache = FALSE}
+# cache = FALSE as a guessed solution to: 
+# 
+# Error in `lazyLoadDBinsertVariable()`:
+# ! long vectors not supported yet: connections.c:6098
+#
+
+# load("ProcessedData/vcsn.2007.2022.RData")
+#  - loaded at the start of the file
+
+# names(vcsn.2007.2022)
+#  [1] "Agent"   "Lat"     "Longt"   "Date"    "MSLP"    "PET"     "Rain"    "RH"      "SoilM"   "ETmp"    "Rad"     "TMax"    "Tmin"
+# [14] "VP"      "Wind"    "Rain_bc" "Tmax_N"  "Tmin_N"
+
+# vcsn.2007.2022cut <- vcsn.2007.2022[, c(1:4, 16)]
+# rm(vcsn.2007.2022)
+#  - moved to top of file
+
+vcsn.2007.2022cut$Month <- format(as.Date(vcsn.2007.2022cut$Date, format = "%Y/%m/%d"), "%m")
+
+# vcsn.2007.2022 doesn't have a year column
+# vcsn.2007.2022cut$Year <- vcsn.2007.2022$Year
+vcsn.2007.2022cut$Year <- format(as.Date(vcsn.2007.2022cut$Date, format = "%Y/%m/%d"), "%Y")
+
+aggy1 <- aggregate(Rain_bc ~ Agent + Month + Year, data = vcsn.2007.2022cut, sum)
+aggy2 <- aggregate(Rain_bc ~ Agent + Month, data = aggy1, mean)
+names(aggy2) <- c("VCSN.Agent", "month", "Rain_bc")
+aggy2$month <- as.numeric(aggy2$month)
+aggy2$VCSN.Agent <- as.character(aggy2$VCSN.Agent)
+
+modeldata <- left_join(aggy2, modeldata, by = c("VCSN.Agent", "month"))
+write.csv(modeldata, "Output/MonthlyResiduals/monthly.isoscape.comparison.csv")
+
+
+combine.vcsn.reg1 <- left_join(combine.vcsn.reg, RMSE.by.site, by = "Site")
+```
+
+These next data frames allow us to compare model representation of temporal AND spatial patterns in precipitation to those in measurements from the Frew dataset (Published as Baisden et al. 2016).   
+
+```{r}
+rawdata <- ddata |> dplyr::select(Date, year, month, d18O, agent.number) |>
+  rename(meas.18O = d18O, VCSN.Agent = agent.number)
+
+head(rawdata)
+
+checkdata <- left_join(rawdata, Baisden, by=c('year'='year', 'month'='month', 'VCSN.Agent' = 'VCSN.Agent'))
+
+length(unique(checkdata$VCSN.Agent))
+modeldata2<-modeldata |> dplyr::select(VCSN.Agent, month, lin18O,  Allen18O,  Krig18O, unco.lin, unco.Allen, unco.krig)
+
+checkdata$VCSN.Agent <- as.character(checkdata$VCSN.Agent)
+
+checkdata<-dplyr::left_join(checkdata, modeldata2, by = c("VCSN.Agent", "month"))
+
+monthly.checkdata<-rawdata|> dplyr::select(year, month, meas.18O, VCSN.Agent) |>
+group_by(VCSN.Agent, month) |>
+  summarise(meas.18O.mean = mean(meas.18O))
+  
+```
+
+This third data frame allows us to compare representation of spatial patterns in precipitation. Here we are looking at unweighted annual means. 
+
+```{r}
+modelmeans<- checkdata |>
+  group_by(VCSN.Agent) |>
+  summarise(meas.18O.mean = mean(meas.18O),
+            Baisden18O.mean = mean(Baisden18O), 
+            lin18O.mean = mean(lin18O), 
+            Allen18O.mean = mean(Allen18O),
+            Krig18O.mean = mean(Krig18O), 
+            unco.lin.mean = mean(unco.lin), 
+            unco.Allen.mean = mean(unco.Allen),
+            unco.krig.mean = mean(unco.krig)
+            )
+
+nz_global_annual$VCSN.Agent <- as.character(nz_global_annual$VCSN.Agent)
+modelmeans<-dplyr::inner_join(modelmeans, nz_global_annual, by = "VCSN.Agent")
+
+head(modelmeans[,6:10])
+```
+
+## Comparison with Kerr transect data
+
+This fourth dataframe allows us to compare representation of spatial patterns across the south Island of New Zealand, where we know there are strong orographic effects. Here we are comparing our predictions with a transect of small streams from west to east across the SOuthern Alps published in Kerr et al. 2015 DOI:10.1175/JHM-D-13-0141.1  
+
+We will compare our three models (corrected and uncorrected) to that of Baisden et al. 2016 and the global model of Bowen&Revenaugh. 
+ 
+```{r}
+kerr <- read.csv("data/Kerr.csv")
+head(kerr)
+```
+
+Make the kerr object have the same CRS as that of the vcsn agents simple features object, Then for each of the Kerr et al. (2015) sampling sites, find the nearest point on the VCSN grid. Join the modelling result dataframe to the Kerr dataframe based on this. 
+
+```{r}
+kerr.sf <- kerr |> 
+  sf::st_as_sf(coords = c("long", "lat"), crs = 4326)
+
+#make a df with unweighted annual means of all VCSN points
+modeldata1<-st_drop_geometry(modeldata.sf)
+modelmeans<- modeldata1 |>
+  group_by(VCSN.Agent) |>
+  summarise(lin18O.mean = mean(lin18O), Allen18O.mean = mean(Allen18O), Krig18O.mean = mean(Krig18O), unco.lin.mean = mean(unco.lin), unco.Allen.mean = mean(unco.Allen), unco.krig.mean = mean(unco.krig))
+modelmeans<-dplyr::inner_join(modelmeans, nz_global_annual, by = "VCSN.Agent")
+vcsn.agent.locations999<-st_drop_geometry(vcsn.agent.locations)
+names(vcsn.agent.locations999)<-c("VCSN.Agent", "vcsn.lon", "vcsn.lat")
+
+vcsn.agent.locations999$VCSN.Agent<-as.character(vcsn.agent.locations999$VCSN.Agent)
+modelmeans<-dplyr::inner_join(modelmeans, vcsn.agent.locations999, by = "VCSN.Agent") 
+
+
+modelmeans1.sf<-modelmeans|> 
+  sf::st_as_sf(coords = c("vcsn.lon", "vcsn.lat"), crs = 4326)
+joined_sf<-kerr.sf |> cbind(modelmeans1.sf[st_nearest_feature(kerr.sf, modelmeans1.sf),])
+joined_sf<-joined_sf |> mutate(dist = st_distance(geometry, geometry.1, by_element = T))
+
+plot(modeldata.sf["lin18O"], cex = 0.5, pch = 16)
+
+kerr.comparison<-st_drop_geometry(joined_sf)
+names(kerr.comparison)<-c("site" , "elevation", "distance.from.tasman.sea",
+                          "NZTME",  "NZTMN",   
+                          "O18_local_river" , "H2_local_river",
+                          "Baisden18O", "Baisden2H",
+                          "VCSN.Agent" ,
+                          "lin18O.corrected",  "Allen18O.corrected",  "Krig18O.corrected",
+                          "unco.lin", "unco.Allen" ,"unco.krig",
+                          "O18global.model",
+                          "geometry", 
+                          "distance to nearest VCSN point")
+
+readr::write_csv(kerr.comparison, "Output/MonthlyResiduals/kerr_comparison.csv")
+
+```
+
+
+
+# Saved data
+
+
+```{r cache=FALSE}
+glimpse(combine.vcsn.reg)
+save(combine.vcsn.reg, file = "Output/Data/combine.vcsn.reg.RData")
+```
+
+```{r cache=FALSE}
+glimpse(meanBaisden)
+save(meanBaisden, file = "Output/Data/meanBaisden.RData")
+```
+
+
+```{r cache=FALSE}
+glimpse(monthly.checkdata)
+save(monthly.checkdata, file = "Output/Data/monthly.checkdata.RData")
+```
+
+
+

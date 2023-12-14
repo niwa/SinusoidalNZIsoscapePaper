@@ -1,0 +1,1645 @@
+---
+title: "Precipitation sinusoidal isocape model: jackknifing"
+author: "Bruce Dudley (NIWA), Andy McKenzie (NIWA)"
+date: "`r format(Sys.Date(), '%d %B, %Y')`"
+output:
+  html_document: 
+    theme: united
+    code_folding: show
+    toc: yes
+    toc_float:
+      collapsed: true   
+    fig_caption: yes
+    number_sections: yes
+    df_print: kable
+  word_document: 
+    toc: yes
+  pdf_document: 
+    toc: yes
+    fig_caption: yes
+    number_sections: yes
+editor_options:
+  chunk_output_type: console
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+# Global options
+#
+# echo = TRUE. Show the code
+# comment = "". Don't put anything in front of results from code
+# warning = FALSE. Don't display warning messages
+# cache = TRUE. Only process new code when you knit
+# dev = 'png'. Save graphics in figure folder as png
+# fig.height = 5. Height of figures (in inches)
+
+# unlink("Output/JackKnifeResults", recursive = TRUE)
+# dir.create("Output/JackKnifeResults")
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  comment = "",
+  warning = FALSE,
+  message = FALSE,
+  cache = TRUE,
+  dev = "png", dpi = 300,
+  fig.height = 5
+)
+
+
+# tidyverse packages
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(readr)
+library(stringr)  # for str_replace() function
+
+
+# https://docs.stadiamaps.com/guides/migrating-from-stamen-map-tiles/#ggmap
+# devtools::install_github("stadiamaps/ggmap”)
+library(ggmap) # get_stamenmap() & ggmap
+# register_stadiamaps("ff428357-71cc-4a08-8912-9111113265ec", write = TRUE)
+
+
+# For map plotting
+library(sf)
+library(stars)
+
+# devtools::install_github("ropensci/rnaturalearthhires")
+library(rnaturalearthhires)
+library(rnaturalearth)
+library(rnaturalearthdata)
+
+library(ggrepel) # geom_text_repel()
+library(cowplot) # multiple plots for a figure
+
+# model kriging
+library(gstat)
+
+rm(list = ls())
+
+source("auxiliary.code.R")
+
+ft <- function(input.data, caption = "", num.rows = Inf) {
+  ft <- input.data |>
+    slice_head(n = num.rows) |>
+    flextable() |>
+    autofit() |>
+    theme_zebra() |>
+    set_caption(caption)
+  ft
+}
+```
+
+
+# Load in data
+
+## Site and mean VCSN data and predicated sinusoidal parameters
+
+```{r}
+load("Output/Data/combine.vcsn.reg.RData")
+glimpse(combine.vcsn.reg)
+
+crs_projected_target <- "EPSG:2193"
+
+combine.vcsn.reg.proj <- st_as_sf(combine.vcsn.reg,
+                                    coords = c("VCSN.lon", "VCSN.lat"),
+                                    remove = FALSE,
+                                    crs = 4326) |> 
+                      st_transform(crs = crs_projected_target) 
+```
+
+## VCSN agent locations and CRS
+
+```{r}
+load("Output/Data/vcsn.agent.locations.RData")
+glimpse(vcsn.agent.locations)
+
+agent.CRS <- sf::st_crs(vcsn.agent.locations)
+```
+
+And a different version
+
+```{r}
+load("Output/Data/vcsn.agent.locations1.RData")
+glimpse(vcsn.agent.locations1)
+
+# used for left_join with resids in a few place latter on
+vcsn.agent.locations1.subset <- vcsn.agent.locations1 |>
+  select(VCSN.Agent, vcsn.lon, vcsn.lat) |>
+  mutate(VCSN.Agent = as.character(VCSN.Agent))
+```
+
+
+## NZ grid in long format
+
+```{r}
+load("Output/Data/nzgrid.long.format.RData")
+glimpse(nzgrid.long.format)
+```
+
+
+## d18O for Baisden and monthly mean value of VCSN data
+
+```{r}
+load("Output/Data/meanBaisden.RData")
+glimpse(meanBaisden)
+```
+
+
+
+## Month checkdata
+
+```{r}
+load("Output/Data/monthly.checkdata.RData")
+glimpse(monthly.checkdata)
+```
+
+
+## Julian days
+
+```{r}
+# Copied over from "03-isocape-monthly-residuals.Rmd" code
+# collection on 15th of each month
+julian.day.month.midpoints <- c(15, 46, 74, 105, 135, 166, 196, 227, 258, 288, 319, 349)
+julian.days <- julian.day.month.midpoints / 365
+julian.days
+```
+
+## Mean value climate data and predicted sinusoidal parameters
+
+
+```{r}
+# Mean value of climate data at an agent location, with appended columns for predicted value
+#  - output from 02-isoscape-kriging-sinusoidal-parameters.Rmd
+#  - load R object has name  "national.climate.summary"
+load(file = "Output/Data/national.climate.summary.02.output.RData")
+dim(national.climate.summary)
+names(national.climate.summary)
+```
+
+
+## Mean value vcsn data
+
+
+```{r}
+load(file = "Output/Data/vcsn.mean.RData")
+dim(vcsn.mean)
+names(vcsn.mean)
+```
+
+
+#Jackknife time
+
+## Amplitude
+
+In our research we are concerned about amplitudes of the seasonal precipitation isotope cycle because we wish to compare young water fractions in rivers across  New Zealand. Many of our river measurement sites have no precipitation isotope records, so we wish to know which model predicts the seasonal amplitudes of new (unmeasured) sites best.  
+
+To examine amplitude prediction we will run a three jackknife analyses, one for each of our interpolation methods.  
+
+To do this we remove one of the 51 training sites at a time, and (having applied our modelling method using the other 50 sites) predict the amplitude at the omitted site. We then calculate the difference between measured and modelled amplitude at our omitted site. At the end of this loop we can calculate 'Rjack', a summary measure of residuals for each model.  
+
+### Jackknife test for uncorrected Allen model (stepwise reduced)
+
+```{r}
+amp.jack <- c()
+
+for (i in 1:length(combine.vcsn.reg$Amplitude)) {
+  mod1 <- lm(Amplitude ~ VCSN.lon + height + AnnualTempRange, data = combine.vcsn.reg[-i, ])
+  new_value <- predict(mod1, newdata = combine.vcsn.reg[i, ])
+
+  amp.jack <- c(amp.jack, new_value)
+}
+
+rjack.allen <- lm(amp.jack ~ combine.vcsn.reg$Amplitude)
+summary(rjack.allen)
+```
+
+### Jackknife test for uncorrected full VCSN model (stepwise reduced )
+
+```{r}
+amp.jack.lm <- c()
+
+for (i in 1:length(combine.vcsn.reg$Amplitude)) {
+  mod1 <- lm(Amplitude ~ height + VCSN.lat + VCSN.lon + PET +
+    Rad + VP + Wind, data = combine.vcsn.reg[-i, ])
+  new_value <- predict(mod1, newdata = combine.vcsn.reg[i, ])
+  amp.jack.lm <- c(amp.jack.lm, new_value)
+}
+
+rjack.lm <- lm(amp.jack.lm ~ combine.vcsn.reg$Amplitude)
+summary(rjack.lm)
+```
+
+### Jackknife test for universial kriging of amplitude using Rad and AnnualTempRange
+
+```{r}
+amp.jack.radkrig <- c()
+
+for (i in 1:length(combine.vcsn.reg.proj$Amplitude)) {
+  vcsn.site <- st_drop_geometry((combine.vcsn.reg.proj[i, 19]))
+  vcsn.point <- as.character(vcsn.site[1, 1])
+  v.trend2 <- gstat::variogram(Amplitude ~ Rad + AnnualTempRange, combine.vcsn.reg.proj[-i, ])
+  v.trend.model2 <- gstat::fit.variogram(v.trend2, vgm(model = "Exp"))
+
+  amp.loop.trend <- gstat::krige(
+    Amplitude ~ Rad + AnnualTempRange,
+    combine.vcsn.reg.proj[-i, ],
+    nzgrid.long.format,
+    v.trend.model2
+  )
+  
+  amp.loop.trend.sf <- amp.loop.trend |>
+    sf::st_transform(crs = agent.CRS)
+  
+  vcsn.agent.locations99 <- vcsn.agent.locations
+  kriging.row.index <- sf::st_nearest_feature(vcsn.agent.locations, amp.loop.trend.sf)
+  vcsn.agent.locations99$Amplitude <- amp.loop.trend.sf$var1.pred[kriging.row.index]
+  vcsn.agent.locations99 <- st_drop_geometry(vcsn.agent.locations99)
+  vcsn.agent.locations99$Agent <- as.character(vcsn.agent.locations99$Agent)
+  newframe <- dplyr::filter(vcsn.agent.locations99, Agent == vcsn.point)
+  new_value <- as.numeric(newframe[4])
+  
+  amp.jack.radkrig <- c(amp.jack.radkrig, new_value)
+  print(paste0("finished ", i))
+}
+
+krigjack.lm <- lm(amp.jack.radkrig ~ combine.vcsn.reg$Amplitude)
+summary(krigjack.lm)
+```
+
+
+### Jackknife test for universial kriging of amplitude using SoilM
+
+```{r}
+amp.jack.soilMkrig <- c()
+
+for (i in 1:length(combine.vcsn.reg.proj$Amplitude)) {
+  vcsn.site <- st_drop_geometry((combine.vcsn.reg.proj[i, 19]))
+  vcsn.point <- as.character(vcsn.site[1, 1])
+  v.trend3 <- gstat::variogram(Amplitude ~ SoilM, combine.vcsn.reg.proj[-i, ])
+
+  v.trend.model3 <- gstat::fit.variogram(v.trend3, vgm(model = "Exp"))
+
+  amp.loop.trend2 <- gstat::krige(
+    Amplitude ~ SoilM,
+    combine.vcsn.reg.proj[-i, ],
+    nzgrid.long.format,
+    v.trend.model3
+  )
+  amp.loop.trend.sf2 <- amp.loop.trend2 |>
+    sf::st_transform(crs = agent.CRS)
+  
+  vcsn.agent.locations100 <- vcsn.agent.locations
+  kriging.row.index <- sf::st_nearest_feature(vcsn.agent.locations100, amp.loop.trend.sf2)
+  vcsn.agent.locations100$Amplitude <-
+    amp.loop.trend.sf2$var1.pred[kriging.row.index]
+  vcsn.agent.locations100 <- st_drop_geometry(vcsn.agent.locations100)
+  vcsn.agent.locations100$Agent <- as.character(vcsn.agent.locations100$Agent)
+  newframe <- dplyr::filter(vcsn.agent.locations100, Agent == vcsn.point)
+  new_value <- as.numeric(newframe[4])
+  
+  amp.jack.soilMkrig <- c(amp.jack.soilMkrig, new_value)
+  print(paste0("finished ", i))
+}
+
+krigjack2.lm <- lm(amp.jack.soilMkrig ~ combine.vcsn.reg$Amplitude)
+summary(krigjack2.lm)
+```
+
+### Jackknife test for a two step amplitude map: Allen model, plus ordinary kriging of residuals as a correction layer. 
+
+```{r}
+# dummy vector
+amp.jack.corrected <- c()
+
+for (i in 1:length(combine.vcsn.reg.proj$Amplitude)) {
+  vcsn.site <- st_drop_geometry((combine.vcsn.reg.proj[i, 19]))
+  vcsn.point <- as.character(vcsn.site[1, 1])
+
+  combine.vcsn.reg.proj.temp <- combine.vcsn.reg.proj[-i, ]
+  mod1 <- lm(Amplitude ~ VCSN.lon + height + AnnualTempRange, 
+             data = combine.vcsn.reg.proj.temp)
+  combine.vcsn.reg.proj.temp$new_values <- predict(mod1, newdata = combine.vcsn.reg.proj.temp)
+  combine.vcsn.reg.proj.temp$lin.mod.resids <- combine.vcsn.reg.proj.temp$new_values -                      combine.vcsn.reg.proj.temp$Amplitude
+
+  v.constant <- gstat::variogram(lin.mod.resids ~ 1, combine.vcsn.reg.proj.temp)
+  v.constant.model <- gstat::fit.variogram(v.constant, vgm(model = "Exp"))
+
+  krig.constant <- gstat::krige(
+    lin.mod.resids ~ 1,
+    combine.vcsn.reg.proj.temp,
+    nzgrid.long.format,
+    v.constant.model
+  )
+  krig.constant.sf <- krig.constant |> sf::st_transform(crs = agent.CRS)
+  
+  vcsn.agent.locations101 <- vcsn.agent.locations
+  kriging.row.index <- sf::st_nearest_feature(vcsn.agent.locations101, krig.constant.sf)
+  vcsn.agent.locations101$correction <- krig.constant.sf$var1.pred[kriging.row.index]
+  vcsn.agent.locations101 <- st_drop_geometry(vcsn.agent.locations101)
+  vcsn.agent.locations101$Agent <- as.character(vcsn.agent.locations101$Agent)
+  newframe <- dplyr::filter(vcsn.agent.locations101, Agent == vcsn.point)
+  correction_value <- as.numeric(newframe[4])
+
+  new_value <- predict(mod1, newdata = combine.vcsn.reg.proj[i, ])
+  corrected_new_value <- new_value - correction_value
+  amp.jack.corrected <- c(amp.jack.corrected, corrected_new_value)
+
+  print(paste0("finished ", i))
+}
+
+rjack.allen.corr <- lm(amp.jack.corrected ~ combine.vcsn.reg$Amplitude)
+summary(rjack.allen.corr)
+```
+
+Plot the residuals from the last example of the cut-down model
+
+```{r}
+krig.constant.stars <- stars::st_as_stars(krig.constant)
+
+plot.krig.constant <- 
+    ggplot() + 
+    geom_stars(data = krig.constant.stars, aes(fill = var1.pred, x = x, y = y)) + 
+    geom_sf(data = combine.vcsn.reg.proj.temp) +
+    coord_sf(expand = FALSE) +
+    scale_fill_continuous(type = "viridis") +
+    labs(fill = "var1") +  
+    xlab("Longitude") +
+    ylab("Latitude") +
+    ggtitle("linear model residuals: ordinary kriging interpolation") 
+
+plot.krig.constant
+```
+
+###Jackknife test for the two-step (ordinary-kriging-corrected) Full model. 
+```{r}
+#dummy vector 
+amp.jack.full.corrected <- c()
+
+for(i in 1:length(combine.vcsn.reg.proj$Amplitude)){
+
+  vcsn.site<-st_drop_geometry((combine.vcsn.reg.proj[i,19]))
+vcsn.point<-as.character(vcsn.site[1,1])
+
+  combine.vcsn.reg.proj.temp<-combine.vcsn.reg.proj[-i,]
+  mod1 <- lm(Amplitude ~ height + VCSN.lat + VCSN.lon + PET + 
+    Rad + VP + Wind, data = combine.vcsn.reg.proj.temp)
+  
+  combine.vcsn.reg.proj.temp$new_values<-predict(mod1, newdata=combine.vcsn.reg.proj.temp)
+  
+  combine.vcsn.reg.proj.temp$lin.mod.resids<-combine.vcsn.reg.proj.temp$new_values -        combine.vcsn.reg.proj.temp$Amplitude
+  
+v.constant <- gstat::variogram(lin.mod.resids ~ 1, combine.vcsn.reg.proj.temp)
+  
+v.constant.model <- gstat::fit.variogram(v.constant, vgm(model = "Exp"))
+
+krig.constant <- gstat::krige(lin.mod.resids ~ 1, 
+                           combine.vcsn.reg.proj.temp, 
+                           nzgrid.long.format, 
+                           v.constant.model)
+krig.constant.sf <- krig.constant |>   sf::st_transform(crs = agent.CRS)
+
+vcsn.agent.locations101<-vcsn.agent.locations
+kriging.row.index <- sf::st_nearest_feature(vcsn.agent.locations101, krig.constant.sf)
+vcsn.agent.locations101$correction <- 
+  
+krig.constant.sf$var1.pred[kriging.row.index]
+vcsn.agent.locations101<-st_drop_geometry(vcsn.agent.locations101)
+vcsn.agent.locations101$Agent<-as.character(vcsn.agent.locations101$Agent)
+newframe<-dplyr::filter(vcsn.agent.locations101, Agent == vcsn.point)
+correction_value<-as.numeric(newframe[4])
+
+new_value<-predict(mod1, newdata=combine.vcsn.reg.proj[i,])
+corrected_new_value<-new_value - correction_value
+amp.jack.full.corrected <- c(amp.jack.full.corrected, corrected_new_value)
+
+print(paste0("finished ", i))  
+
+}
+rjack.full.corr<-lm(amp.jack.full.corrected~combine.vcsn.reg$Amplitude)
+summary(rjack.full.corr)
+```
+### Jackknife for regression kriging plus kriging of correction layer. 
+```{r}
+#dummy vector 
+soilMkrig.corrected <- c()
+
+#Loop to make universal kriging dataframe, pull out ith value, make residuals dataframe using other 50 sites, ordinary krig it, pull out correction for ith site and subtract it from the uncorrected value...then add it to the amplitude vector. 
+for (i in 1:length(combine.vcsn.reg.proj$Amplitude)) {
+  vcsn.site <- st_drop_geometry((combine.vcsn.reg.proj[i, 19]))
+  vcsn.point <- as.character(vcsn.site[1, 1])
+
+  combine.vcsn.reg.proj.temp <- combine.vcsn.reg.proj[-i, c(1:20)]
+
+  # run the soilM universal kriging using n-1 sites
+  v.trend3 <- gstat::variogram(Amplitude ~ SoilM, combine.vcsn.reg.proj.temp)
+
+  v.trend.model3 <- gstat::fit.variogram(v.trend3, vgm(model = "Exp"))
+
+  amp.loop.trend2 <- gstat::krige(
+    Amplitude ~ SoilM,
+    combine.vcsn.reg.proj.temp,
+    nzgrid.long.format,
+    v.trend.model3
+  )
+  amp.loop.trend.sf2 <- amp.loop.trend2 |>
+    sf::st_transform(crs = agent.CRS)
+
+  # Attach the results to the VCSN grid
+
+  vcsn.agent.locations100 <- vcsn.agent.locations
+
+  vcsn.agent.locations100 <- vcsn.agent.locations100 |>
+    sf::st_as_sf(coords = c("vcsn.lon", "vcsn.lat"), crs = agent.CRS)
+
+  kriging.row.index <- sf::st_nearest_feature(vcsn.agent.locations100, amp.loop.trend.sf2)
+  vcsn.agent.locations100$mod.amplitude <-
+    amp.loop.trend.sf2$var1.pred[kriging.row.index]
+
+  # Pull out the uncorrected value for the n-1 point
+  vcsn.agent.locations100 <- st_drop_geometry(vcsn.agent.locations100)
+  newframe <- dplyr::filter(vcsn.agent.locations100, Agent == vcsn.point)
+  new_value <- as.numeric(newframe[4])
+
+  # Then select the results from the grid to match the other 50 measurement sites
+
+
+  combine.vcsn.reg.proj.temp <- as.data.frame(st_drop_geometry(combine.vcsn.reg.proj.temp))
+
+  colnames(combine.vcsn.reg.proj.temp)[19] <- "Agent"
+  combine.vcsn.reg.proj.temp <- dplyr::inner_join(combine.vcsn.reg.proj.temp, vcsn.agent.locations100, by = "Agent")
+
+
+
+  # make residuals column
+
+  combine.vcsn.reg.proj.temp$krigM.resids <- combine.vcsn.reg.proj.temp$mod.amplitude - combine.vcsn.reg.proj.temp$Amplitude
+
+  ## convert back to simple features object with projected crs
+
+  combine.vcsn.reg.proj.temp <- combine.vcsn.reg.proj.temp |>
+    sf::st_as_sf(coords = c("vcsn.lon", "vcsn.lat"), crs = crs_projected_target)
+
+  v.constant <- gstat::variogram(krigM.resids ~ 1, combine.vcsn.reg.proj.temp)
+
+  v.constant.model <- gstat::fit.variogram(v.constant, vgm(model = "Exp"))
+
+  krig.constant <- gstat::krige(
+    krigM.resids ~ 1,
+    combine.vcsn.reg.proj.temp,
+    nzgrid.long.format,
+    v.constant.model
+  )
+  krig.constant.sf <- krig.constant |>
+    sf::st_transform(crs = agent.CRS)
+  vcsn.agent.locations101 <- vcsn.agent.locations
+
+
+  vcsn.agent.locations101 <- vcsn.agent.locations101 |>
+    sf::st_as_sf(coords = c("vcsn.lon", "vcsn.lat"), crs = agent.CRS)
+
+
+  kriging.row.index <- sf::st_nearest_feature(vcsn.agent.locations101, krig.constant.sf)
+  vcsn.agent.locations101$correction <-
+    krig.constant.sf$var1.pred[kriging.row.index]
+
+  # pull out correction values for ith site
+
+  vcsn.agent.locations101 <- st_drop_geometry(vcsn.agent.locations101)
+  vcsn.agent.locations101$Agent <- as.character(vcsn.agent.locations101$Agent)
+  newframe1 <- dplyr::filter(vcsn.agent.locations101, Agent == vcsn.point)
+  correction_value <- as.numeric(newframe1[4])
+
+  # get corrected value and add to vector
+
+  corrected_new_value <- new_value - correction_value
+
+  soilMkrig.corrected <- c(soilMkrig.corrected, new_value)
+  print(paste0("finished ", i))
+}
+
+soilMkrig.corr <- lm(soilMkrig.corrected ~ combine.vcsn.reg$Amplitude)
+summary(rjack.full.corr)
+```
+
+
+##Offset
+
+We can use LOOCV to test linear model performance, and we are not interested in offset as an 'output', so here we will only use the jackknife loops to test a few different options for universal kriging. First the model selected from the regression trees
+
+###Full regression tree model - universal kriging 
+
+
+```{r}
+jack.offset <- c()
+
+for (i in 1:length(combine.vcsn.reg.proj$offset)) {
+  vcsn.site <- st_drop_geometry((combine.vcsn.reg.proj[i, 19]))
+  vcsn.point <- as.character(vcsn.site[1, 1])
+  v.trend3 <- gstat::variogram(offset ~ VP + AnnualTempRange + ETmp + SoilM,                  combine.vcsn.reg.proj[-i, ])
+
+  v.trend.model3 <- gstat::fit.variogram(v.trend3, vgm(model = "Exp"))
+
+  amp.loop.trend2 <- gstat::krige(
+    offset ~ VP + AnnualTempRange + ETmp + SoilM,
+    combine.vcsn.reg.proj[-i, ],
+    nzgrid.long.format,
+    v.trend.model3
+  )
+  amp.loop.trend.sf2 <- amp.loop.trend2 |>
+    sf::st_transform(crs = agent.CRS)
+  vcsn.agent.locations100 <- vcsn.agent.locations
+  kriging.row.index <- sf::st_nearest_feature(vcsn.agent.locations100, amp.loop.trend.sf2)
+  vcsn.agent.locations100$offset <-
+    amp.loop.trend.sf2$var1.pred[kriging.row.index]
+  vcsn.agent.locations100 <- st_drop_geometry(vcsn.agent.locations100)
+  vcsn.agent.locations100$Agent <- as.character(vcsn.agent.locations100$Agent)
+  newframe <- dplyr::filter(vcsn.agent.locations100, Agent == vcsn.point)
+  new_value <- as.numeric(newframe[4])
+  jack.offset <- c(jack.offset, new_value)
+  print(paste0("finished ", i))
+}
+
+krigjackoffset.lm <- lm(jack.offset ~ combine.vcsn.reg$offset)
+summary(krigjackoffset.lm)
+```
+
+###  Reduced regression tree model - universal kriging 
+
+
+```{r}
+jack.offset.small <- c()
+
+for (i in 1:length(combine.vcsn.reg.proj$offset)) {
+  vcsn.site <- st_drop_geometry((combine.vcsn.reg.proj[i, 19]))
+  vcsn.point <- as.character(vcsn.site[1, 1])
+  v.trend3 <- gstat::variogram(offset ~ SoilM, combine.vcsn.reg.proj[-i, ])
+
+  v.trend.model3 <- gstat::fit.variogram(v.trend3, vgm(model = "Exp"))
+
+  amp.loop.trend2 <- gstat::krige(
+    offset ~ SoilM,
+    combine.vcsn.reg.proj[-i, ],
+    nzgrid.long.format,
+    v.trend.model3
+  )
+  amp.loop.trend.sf2 <- amp.loop.trend2 |>  sf::st_transform(crs = agent.CRS)
+  vcsn.agent.locations100 <- vcsn.agent.locations
+  kriging.row.index <- sf::st_nearest_feature(vcsn.agent.locations100, amp.loop.trend.sf2)
+  vcsn.agent.locations100$offset <- amp.loop.trend.sf2$var1.pred[kriging.row.index]
+  vcsn.agent.locations100 <- st_drop_geometry(vcsn.agent.locations100)
+  vcsn.agent.locations100$Agent <- as.character(vcsn.agent.locations100$Agent)
+  
+  newframe <- dplyr::filter(vcsn.agent.locations100, Agent == vcsn.point)
+  new_value <- as.numeric(newframe[4])
+  jack.offset.small <- c(jack.offset.small, new_value)
+  
+  print(paste0("finished ", i))
+}
+
+krigjackoffsmall.lm <- lm(jack.offset.small ~ combine.vcsn.reg$offset)
+summary(krigjackoffsmall.lm)
+```
+
+
+
+
+# Jackknife tests for monthly isotope predictions
+
+We have six models to compare. Each of these models generates monthly isotope predictions at VCSN sites. We test them against mean monthly isotope values from the Frew/Baisden dataset. 
+The mean isotope values for each site are in the data frame 'meanBaisden'
+
+```{r}
+head(meanBaisden)
+```
+
+
+The six models are:
+
+- The Allen linear model without and then with ordinary kriging correction on monthly outputs
+
+- The 'full' VCSN parameter linear model without and then with ordinary kriging correction on monthly outputs
+
+- The regression kriging (universal kriging) model without and with ordinary kriging correction on monthly outputs. 
+
+In this last case it seems that the second kriging step is redundant, and makes
+the results worse, so probably won't be included in the final summary. 
+
+##Uncorrected Allen model
+
+Using the predictors selected by Allen et al. (2018) applied to the Frew dataset, The amplitude, phase and offset models selected using StepAIC and LOOCV follow the form:
+
+Amplitude: Amplitude ~ VCSN.lon + height + AnnualTempRange 
+
+Phase: phase ~ VCSN.lat + VCSN.lon
+
+Offset: VCSN.lat + VCSN.lon + height + Rain_bc + AnnualTempRange
+
+
+
+```{r}
+amp.jack <- c()
+phase.jack <- c()
+offset.jack <- c()
+
+for (i in 1:length(combine.vcsn.reg$Amplitude)) {
+  mod1.amp <- lm(Amplitude ~ VCSN.lon + height + AnnualTempRange, data = combine.vcsn.reg[-i, ])
+  new_amp_value <- predict(mod1.amp, newdata = combine.vcsn.reg[i, ])
+  amp.jack <- c(amp.jack, new_amp_value)
+
+  mod1.phase <- lm(phase ~ VCSN.lat + VCSN.lon, data = combine.vcsn.reg[-i, ])
+  new_phase_value <- predict(mod1.phase, newdata = combine.vcsn.reg[i, ])
+  phase.jack <- c(phase.jack, new_phase_value)
+
+  mod1.offset <- lm(offset ~ VCSN.lat + VCSN.lon, data = combine.vcsn.reg[-i, ])
+  new_offset_value <- predict(mod1.offset, newdata = combine.vcsn.reg[i, ])
+  offset.jack <- c(offset.jack, new_offset_value)
+}
+VCSN.Agent <- combine.vcsn.reg$VCSN.Agent
+dummy_df <- data.frame(amp.jack, phase.jack, offset.jack, VCSN.Agent)
+
+calc_precip_isotope <- function(julian.fraction) {
+  dummy_df$amp.jack * (sin((2 * pi * julian.fraction) - dummy_df$phase.jack)) + dummy_df$offset.jack
+}
+
+
+for (i in julian.days) {
+  new <- calc_precip_isotope(i) # Create new column of d18O predictions
+  dummy_df[, ncol(dummy_df) + 1] <- new # Append new column
+  colnames(dummy_df)[ncol(dummy_df)] <- paste0("new", i) # Rename column name
+}
+
+names(dummy_df) <- c("amplitude", "phase", "offset", "VCSN.Agent", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12")
+
+dummy_df.long <- dummy_df |> gather(month, d18O, as.character(1:12), factor_key = TRUE)
+dummy_df.long$VCSN.Agent <- as.character(dummy_df.long$VCSN.Agent)
+dummy_df.long$month <- as.character(dummy_df.long$month)
+monthly.checkdata$VCSN.Agent <- as.character(monthly.checkdata$VCSN.Agent)
+monthly.checkdata$month <- as.character(monthly.checkdata$month)
+dummy_df.long <- dummy_df.long[, 4:6]
+names(dummy_df.long) <- c("VCSN.Agent", "month", "d18O.Allen.jack")
+
+head(dummy_df.long)
+tail(dummy_df.long)
+
+jacked.data <- dplyr::inner_join(monthly.checkdata, dummy_df.long,
+  by = c("VCSN.Agent" = "VCSN.Agent", "month" = "month")
+)
+
+plot(jacked.data$meas.18O.mean ~ jacked.data$d18O.Allen.jack)
+allen.jack.check <- lm(formula = jacked.data$meas.18O.mean ~ jacked.data$d18O.Allen.jack)
+summary(allen.jack.check)
+
+write.csv(jacked.data, "Output/JackKnifeResults/Allen model jackknife results.csv")
+```
+
+##Uncorrected 'full' model
+
+Model structure selected  using StepAIC and LOOCV from the full range of VCSN parameters, plus lat, long, annual temperature range and elevation. Again, predictor selections were tested using the Frew dataset. The amplitude, phase and offset models follow the form:
+
+Amplitude:Amplitude ~ height + VCSN.lat + VCSN.lon + PET +
+  Rad + VP + Wind(A.mod1.step)
+  
+Phase:phase ~ height + island + VCSN.lat + VCSN.lon + VCSN.lat:VCSN.lon +
+  MSLP + Rad + SoilM +
+  VP + Wind + AnnualTempRange
+  
+Offset:offset ~ height +
+  island +
+  VCSN.lon +
+  ETmp + MSLP +
+  Rain_bc +
+  RH +
+  VP + AnnualTempRange
+
+```{r}
+amp.jack <- c()
+phase.jack <- c()
+offset.jack <- c()
+
+for (i in 1:length(combine.vcsn.reg$Amplitude)) {
+  mod1.amp <- lm(Amplitude ~ height + VCSN.lat + VCSN.lon + PET +
+    Rad + VP + Wind, data = combine.vcsn.reg[-i, ])
+  new_amp_value <- predict(mod1.amp, newdata = combine.vcsn.reg[i, ])
+  amp.jack <- c(amp.jack, new_amp_value)
+
+  mod1.phase <- lm(phase ~ height + island + VCSN.lat + VCSN.lon + VCSN.lat:VCSN.lon +
+    MSLP + Rad + SoilM +
+    VP + Wind + AnnualTempRange, data = combine.vcsn.reg[-i, ])
+  new_phase_value <- predict(mod1.phase, newdata = combine.vcsn.reg[i, ])
+  phase.jack <- c(phase.jack, new_phase_value)
+
+  mod1.offset <- lm(offset ~ height +
+    island +
+    VCSN.lon +
+    ETmp + MSLP +
+    Rain_bc +
+    RH +
+    VP + AnnualTempRange, data = combine.vcsn.reg[-i, ])
+  new_offset_value <- predict(mod1.offset, newdata = combine.vcsn.reg[i, ])
+  offset.jack <- c(offset.jack, new_offset_value)
+}
+VCSN.Agent <- combine.vcsn.reg$VCSN.Agent
+dummy_df <- data.frame(amp.jack, phase.jack, offset.jack, VCSN.Agent)
+
+calc_precip_isotope <- function(julian.fraction) {
+  dummy_df$amp.jack * (sin((2 * pi * julian.fraction) - dummy_df$phase.jack)) + dummy_df$offset.jack
+}
+
+
+for (i in julian.days) {
+  new <- calc_precip_isotope(i) # Create new column of d18O predictions
+  dummy_df[, ncol(dummy_df) + 1] <- new # Append new column
+  colnames(dummy_df)[ncol(dummy_df)] <- paste0("new", i) # Rename column name
+}
+
+names(dummy_df) <- c("amplitude", "phase", "offset", "VCSN.Agent", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12")
+
+dummy_df.long <- dummy_df |> gather(month, d18O, as.character(1:12), factor_key = TRUE)
+dummy_df.long$VCSN.Agent <- as.character(dummy_df.long$VCSN.Agent)
+dummy_df.long$month <- as.character(dummy_df.long$month)
+monthly.checkdata$VCSN.Agent <- as.character(monthly.checkdata$VCSN.Agent)
+monthly.checkdata$month <- as.character(monthly.checkdata$month)
+dummy_df.long <- dummy_df.long[, 4:6]
+names(dummy_df.long) <- c("VCSN.Agent", "month", "d18O.Full.jack")
+
+head(dummy_df.long)
+tail(dummy_df.long)
+
+jacked.data <- dplyr::inner_join(monthly.checkdata, dummy_df.long, by = c("VCSN.Agent" = "VCSN.Agent", "month" = "month"))
+
+plot(jacked.data$meas.18O.mean ~ jacked.data$d18O.Full.jack)
+
+full.jack.check <- lm(formula = jacked.data$meas.18O.mean ~ jacked.data$d18O.Full.jack)
+summary(full.jack.check)
+
+write.csv(jacked.data, "Output/JackKnifeResults/Full linear model jackknife results.csv")
+```
+
+
+## Uncorrected 'universal kriging' model
+
+Parameters in the regression parts of these kriging predictions were selected  using regression trees from the full range of VCSN parameters, plus lat, long, annual temperature range and elevation. Some models were tested using performance in predicting fitted parameters (in jackknife tests) as above. Again, all model selections were tested using the Frew dataset. The amplitude, phase and offset models follow the form:
+
+Amplitude: <- gstat::variogram(Amplitude ~ SoilM, combine.vcsn.reg.proj)
+
+Phase:  <- gstat::variogram(phase ~ VP + height 
+
+Offset:  <- gstat::variogram(offset ~ VP + AnnualTempRange + ETmp + SoilM
+
+
+
+
+```{r}
+amp.jack <- c()
+phase.jack <- c()
+offset.jack <- c()
+# amplitude
+
+for (i in 1:length(combine.vcsn.reg.proj$Amplitude)) {
+  vcsn.site <- st_drop_geometry((combine.vcsn.reg.proj[i, 19]))
+  vcsn.point <- as.character(vcsn.site[1, 1])
+  v.trend3 <- gstat::variogram(Amplitude ~ SoilM, combine.vcsn.reg.proj[-i, ])
+
+  v.trend.model3 <- gstat::fit.variogram(v.trend3, vgm(model = "Exp"))
+
+  amp.loop.trend2 <- gstat::krige(
+    Amplitude ~ SoilM,
+    combine.vcsn.reg.proj[-i, ],
+    nzgrid.long.format,
+    v.trend.model3
+  )
+  
+  amp.loop.trend.sf2 <- amp.loop.trend2 |>
+    sf::st_transform(crs = agent.CRS)
+  vcsn.agent.locations100 <- vcsn.agent.locations
+  kriging.row.index <- sf::st_nearest_feature(vcsn.agent.locations100, amp.loop.trend.sf2)
+  vcsn.agent.locations100$Amplitude <-
+    amp.loop.trend.sf2$var1.pred[kriging.row.index]
+  vcsn.agent.locations100 <- st_drop_geometry(vcsn.agent.locations100)
+  vcsn.agent.locations100$Agent <- as.character(vcsn.agent.locations100$Agent)
+  newframe <- dplyr::filter(vcsn.agent.locations100, Agent == vcsn.point)
+  new_value <- as.numeric(newframe[4])
+  amp.jack <- c(amp.jack, new_value)
+
+  # phase
+
+  v.trend3 <- gstat::variogram(phase ~ VP + height, combine.vcsn.reg.proj[-i, ])
+
+  v.trend.model3 <- gstat::fit.variogram(v.trend3, vgm(model = "Exp"))
+
+  amp.loop.trend2 <- gstat::krige(
+    phase ~ VP + height,
+    combine.vcsn.reg.proj[-i, ],
+    nzgrid.long.format,
+    v.trend.model3
+  )
+  
+  amp.loop.trend.sf2 <- amp.loop.trend2 |>
+    sf::st_transform(crs = agent.CRS)
+  vcsn.agent.locations100 <- vcsn.agent.locations
+  kriging.row.index <- sf::st_nearest_feature(vcsn.agent.locations100, amp.loop.trend.sf2)
+  vcsn.agent.locations100$offset <-
+    amp.loop.trend.sf2$var1.pred[kriging.row.index]
+  vcsn.agent.locations100 <- st_drop_geometry(vcsn.agent.locations100)
+  vcsn.agent.locations100$Agent <- as.character(vcsn.agent.locations100$Agent)
+  newframe <- dplyr::filter(vcsn.agent.locations100, Agent == vcsn.point)
+  new_value <- as.numeric(newframe[4])
+  phase.jack <- c(phase.jack, new_value)
+
+  # offset
+
+  v.trend3 <- gstat::variogram(offset ~ VP + AnnualTempRange + ETmp + SoilM, combine.vcsn.reg.proj[-i, ])
+
+  v.trend.model3 <- gstat::fit.variogram(v.trend3, vgm(model = "Exp"))
+
+  amp.loop.trend2 <- gstat::krige(
+    offset ~ VP + AnnualTempRange + ETmp + SoilM,
+    combine.vcsn.reg.proj[-i, ],
+    nzgrid.long.format,
+    v.trend.model3
+  )
+  amp.loop.trend.sf2 <- amp.loop.trend2 |>
+    sf::st_transform(crs = agent.CRS)
+  vcsn.agent.locations100 <- vcsn.agent.locations
+  kriging.row.index <- sf::st_nearest_feature(vcsn.agent.locations100, amp.loop.trend.sf2)
+  vcsn.agent.locations100$offset <-
+    amp.loop.trend.sf2$var1.pred[kriging.row.index]
+  vcsn.agent.locations100 <- st_drop_geometry(vcsn.agent.locations100)
+  vcsn.agent.locations100$Agent <- as.character(vcsn.agent.locations100$Agent)
+  newframe <- dplyr::filter(vcsn.agent.locations100, Agent == vcsn.point)
+  new_value <- as.numeric(newframe[4])
+  offset.jack <- c(offset.jack, new_value)
+
+  print(paste0("finished ", i))
+}  # end of loop over sites
+
+VCSN.Agent <- combine.vcsn.reg$VCSN.Agent
+dummy_df <- data.frame(amp.jack, phase.jack, offset.jack, VCSN.Agent)
+
+calc_precip_isotope <- function(julian.fraction) {
+  dummy_df$amp.jack * (sin((2 * pi * julian.fraction) - dummy_df$phase.jack)) + dummy_df$offset.jack
+}
+
+
+for (i in julian.days) {
+  new <- calc_precip_isotope(i) # Create new column of d18O predictions
+  dummy_df[, ncol(dummy_df) + 1] <- new # Append new column
+  colnames(dummy_df)[ncol(dummy_df)] <- paste0("new", i) # Rename column name
+}
+
+names(dummy_df) <- c("amplitude", "phase", "offset", "VCSN.Agent", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12")
+
+dummy_df.long <- dummy_df |> gather(month, d18O, as.character(1:12), factor_key = TRUE)
+dummy_df.long$VCSN.Agent <- as.character(dummy_df.long$VCSN.Agent)
+dummy_df.long$month <- as.character(dummy_df.long$month)
+monthly.checkdata$VCSN.Agent <- as.character(monthly.checkdata$VCSN.Agent)
+monthly.checkdata$month <- as.character(monthly.checkdata$month)
+dummy_df.long <- dummy_df.long[, 4:6]
+names(dummy_df.long) <- c("VCSN.Agent", "month", "d18O.Full.jack")
+
+head(dummy_df.long)
+tail(dummy_df.long)
+
+jacked.data <- dplyr::inner_join(monthly.checkdata, dummy_df.long, by = c("VCSN.Agent" = "VCSN.Agent", "month" = "month"))
+
+plot(jacked.data$meas.18O.mean ~ jacked.data$d18O.Full.jack)
+
+krig.jack.check <- lm(formula = jacked.data$meas.18O.mean ~ jacked.data$d18O.Full.jack)
+
+summary(krig.jack.check)
+
+write.csv(jacked.data, "Output/JackKnifeResults/Full universal kriging model jackknife results.csv")
+```
+
+##  Corrected Allen model
+
+This requires the basic linear model, and a correction for each month of the year. 
+
+
+
+```{r}
+acdf <- c(1:12)
+dummy_mat <- matrix(acdf, ncol = 1)
+Allen.corr.df <- as.data.frame(dummy_mat)
+
+calc_precip_isotope <- function(julian.fraction) {
+  dummy_df$amp.jack * (sin((2 * pi * julian.fraction) - dummy_df$phase.jack)) + dummy_df$offset.jack
+}
+
+
+
+for (i in 1:length(combine.vcsn.reg$Amplitude)) {
+  # point we're pulling out at the end of each loop
+
+  vcsn.site <- st_drop_geometry((combine.vcsn.reg.proj[i, 19]))
+  vcsn.point <- as.character(vcsn.site[1, 1])
+
+  # All VCSN points without climate data
+  vcsn.agent.locations_dummy <- vcsn.agent.locations
+
+  # all vcsn locations and climate data
+  national.climate.summary_dummy <- national.climate.summary[, 1:15]
+  # dataframe of measurement sites and their climate data except the n-1 site
+  test.dataframe <- combine.vcsn.reg[-i, 1:20]
+  # vector of unique vcsn numbers in the n-1 dataframe
+  vcsn.vector <- unique(test.dataframe$VCSN.Agent)
+
+  # begin modelling
+  mod1.amp <- lm(Amplitude ~ VCSN.lon + height + AnnualTempRange, data = test.dataframe)
+  amp.jack <- predict(mod1.amp, newdata = national.climate.summary_dummy)
+
+  mod1.phase <- lm(phase ~ VCSN.lat + VCSN.lon, data = test.dataframe)
+  phase.jack <- predict(mod1.phase, newdata = national.climate.summary_dummy)
+
+  mod1.offset <- lm(offset ~ VCSN.lat + VCSN.lon, data = test.dataframe)
+  offset.jack <- predict(mod1.offset, newdata = national.climate.summary_dummy)
+
+
+  VCSN.Agent <- national.climate.summary_dummy$VCSN.Agent
+  dummy_df <- data.frame(amp.jack, phase.jack, offset.jack, VCSN.Agent)
+
+
+  for (j in julian.days) {
+    new <- calc_precip_isotope(j) # Create new column of d18O predictions
+    dummy_df[, ncol(dummy_df) + 1] <- new # Append new column
+    colnames(dummy_df)[ncol(dummy_df)] <- paste0("new", j) # Rename column name
+  }
+
+  names(dummy_df) <- c("amplitude", "phase", "offset", "VCSN.Agent", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12")
+
+  dummy_df.long <- dummy_df |> gather(month, d18O, as.character(1:12), factor_key = TRUE)
+  dummy_df.long$VCSN.Agent <- as.character(dummy_df.long$VCSN.Agent)
+  dummy_df.long$month <- as.character(dummy_df.long$month)
+
+
+  monthly.checkdata1 <- dplyr::filter(monthly.checkdata, VCSN.Agent %in% vcsn.vector)
+
+  monthly.checkdata1$VCSN.Agent <- as.character(monthly.checkdata1$VCSN.Agent)
+  monthly.checkdata1$month <- as.character(monthly.checkdata1$month)
+  dummy_df.long <- dummy_df.long[, 4:6]
+  names(dummy_df.long) <- c("VCSN.Agent", "month", "d18O.Allen.jack")
+
+  head(dummy_df.long)
+  tail(dummy_df.long)
+
+  jacked.data <- dplyr::inner_join(monthly.checkdata1, 
+                                   dummy_df.long,
+                                   by = c("VCSN.Agent" = "VCSN.Agent", "month" = "month"))
+
+
+  jacked.data$Allen.resid <- jacked.data$d18O.Allen.jack - jacked.data$meas.18O.mean
+  resids.frame <- jacked.data
+
+  resids.frame <- left_join(resids.frame,
+                            vcsn.agent.locations1.subset,
+                            by = c("VCSN.Agent" = "VCSN.Agent"))
+  vcsn.mean$Agent <- as.character(vcsn.mean$Agent)
+  resids.frame <- left_join(resids.frame,
+                            vcsn.mean, 
+                            by = c("VCSN.Agent" = "Agent"))
+  resids.frame <- resids.frame[, c(1:8, 11:21)]
+
+
+  resids.frame.proj <- st_as_sf(resids.frame,
+    coords = c("vcsn.lon", "vcsn.lat"),
+    remove = FALSE,
+    crs = 4326
+  ) |>
+    st_transform(crs = crs_projected_target)
+
+  monthly <- unique(resids.frame.proj$month)
+
+  for (mth in monthly) {
+    resids.frame1 <- resids.frame.proj[resids.frame.proj$month == mth, ]
+    resid.trend <- gstat::variogram(Allen.resid ~ 1, resids.frame1)
+    trend.model <- gstat::fit.variogram(resid.trend, vgm(model = "Exp"))
+    krig.trend <- gstat::krige(
+      Allen.resid ~ 1,
+      resids.frame1,
+      nzgrid.long.format,
+      trend.model
+    )
+    krig.trend.sf <- krig.trend |>
+      sf::st_transform(crs = agent.CRS)
+    kriging.row.index1 <- sf::st_nearest_feature(vcsn.agent.locations, krig.trend.sf)
+    new <- krig.trend.sf$var1.pred[kriging.row.index1] # Make a new column of residuals
+    vcsn.agent.locations_dummy[, ncol(vcsn.agent.locations_dummy) + 1] <- new # Append new column
+    colnames(vcsn.agent.locations_dummy)[ncol(vcsn.agent.locations_dummy)] <- paste0("Allen.resids.", mth) # Rename column name
+  }
+
+
+  fatAllen18Oframe <- dummy_df.long |>
+    dplyr::select(VCSN.Agent, month, d18O.Allen.jack) |> # select the named columns
+    spread(month, d18O.Allen.jack) |> # convert from long to wide format
+    ungroup() # ungroup
+
+
+  Allenresids <- as.data.frame(vcsn.agent.locations_dummy)
+  names(Allenresids)[names(Allenresids) == "Agent"] <- "VCSN.Agent"
+  Allenresids$VCSN.Agent <- as.character(Allenresids$VCSN.Agent)
+  fatAllen18Oframe$VCSN.Agent <- as.character(fatAllen18Oframe$VCSN.Agent)
+  Allensubtract <- dplyr::left_join(Allenresids, fatAllen18Oframe, by = "VCSN.Agent")
+  Allensubtract <- Allensubtract[, c(1:17, 21:28, 18:20)]
+  Allensubtract <- as.data.frame(Allensubtract)
+  chop1 <- Allensubtract[, 17:28]
+  chop2 <- Allensubtract[, 5:16]
+  chop3 <- chop1 - chop2
+  Allenmodelfinal <- cbind((vcsn.agent.locations1[, c(1:4)]), chop3)
+  Allenmodel.df <- as.data.frame(Allenmodelfinal)
+  Allenmodel.df <- Allenmodel.df[, c(1:3, 16, 4:15)]
+  Allenmodel.df <- gather(Allenmodel.df, month, "Allen18O", 5:16, factor_key = TRUE)
+  Allenmodel.df$month <- str_replace(Allenmodel.df$month, "X", "")
+
+  new_frame <- dplyr::filter(Allenmodel.df, VCSN.Agent == vcsn.point) # Creating new value
+  new_col <- new_frame$Allen18O # Create new column
+  Allen.corr.df[, ncol(Allen.corr.df) + 1] <- new_col # Append new column
+  colnames(Allen.corr.df)[ncol(Allen.corr.df)] <- paste0("new", vcsn.point) # Appending new value to vector
+
+  print(paste0("finished ", i))
+  
+}   # end of big looop
+
+# plot(jacked.data$meas.18O.mean~jacked.data$d18O.Allen.jack)
+# allen.jack.check<-lm(formula = jacked.data$meas.18O.mean ~ jacked.data$d18O.Allen.jack)
+# summary(allen.jack.check)
+```
+##Corrected Full Linear model
+
+This requires the full linear model, and a correction for each month of the year.
+
+Amplitude: Amplitude ~ height + VCSN.lat + VCSN.lon + PET + 
+    Rad + VP + Wind (A.mod1.step)
+    
+Phase: phase ~ height + island + VCSN.lat + VCSN.lon + VCSN.lat:VCSN.lon +
+                 MSLP + Rad + SoilM +
+                 VP + Wind + AnnualTempRange
+                 
+Offset: offset ~  height +
+                 island +
+                 VCSN.lon +
+                 ETmp + MSLP +
+                 Rain_bc + 
+                 RH +
+                 VP + AnnualTempRange
+
+
+```{r}
+acdf <- c(1:12)
+dummy_mat <- matrix(acdf, ncol = 1)
+Linear.corr.df <- as.data.frame(dummy_mat)
+
+calc_precip_isotope <- function(julian.fraction) {
+  dummy_df$amp.jack * (sin((2 * pi * julian.fraction) - dummy_df$phase.jack)) + dummy_df$offset.jack
+}
+
+for (i in 1:length(combine.vcsn.reg$Amplitude)) {
+  # point we're pulling out at the end of each loop
+
+  vcsn.site <- st_drop_geometry((combine.vcsn.reg.proj[i, 19]))
+  vcsn.point <- as.character(vcsn.site[1, 1])
+
+  # All VCSN points without climate data
+  vcsn.agent.locations_dummy <- vcsn.agent.locations
+
+  # all vcsn locations and climate data
+  national.climate.summary_dummy <- national.climate.summary[, 1:15]
+  # dataframe of measurement sites and their climate data except the n-1 site
+  test.dataframe <- combine.vcsn.reg[-i, 1:20]
+  # vector of unique vcsn numbers in the n-1 dataframe
+  vcsn.vector <- unique(test.dataframe$VCSN.Agent)
+
+  # begin modelling
+  mod1.amp <- lm(Amplitude ~ height + VCSN.lat + VCSN.lon + PET +
+    Rad + VP + Wind, data = test.dataframe)
+  amp.jack <- predict(mod1.amp, newdata = national.climate.summary_dummy)
+
+  mod1.phase <- lm(phase ~ height + island + VCSN.lat + VCSN.lon + VCSN.lat:VCSN.lon +
+    MSLP + Rad + SoilM +
+    VP + Wind + AnnualTempRange, data = test.dataframe)
+  phase.jack <- predict(mod1.phase, newdata = national.climate.summary_dummy)
+
+  mod1.offset <- lm(offset ~ height +
+    island +
+    VCSN.lon +
+    ETmp + MSLP +
+    Rain_bc +
+    RH +
+    VP + AnnualTempRange, data = test.dataframe)
+
+  offset.jack <- predict(mod1.offset, newdata = national.climate.summary_dummy)
+
+
+  VCSN.Agent <- national.climate.summary_dummy$VCSN.Agent
+  dummy_df <- data.frame(amp.jack, phase.jack, offset.jack, VCSN.Agent)
+
+
+  for (j in julian.days) {
+    new <- calc_precip_isotope(j) # Create new column of d18O predictions
+    dummy_df[, ncol(dummy_df) + 1] <- new # Append new column
+    colnames(dummy_df)[ncol(dummy_df)] <- paste0("new", j) # Rename column name
+  }
+
+  names(dummy_df) <- c("amplitude", "phase", "offset", "VCSN.Agent", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12")
+
+  dummy_df.long <- dummy_df |> gather(month, d18O, as.character(1:12), factor_key = TRUE)
+  dummy_df.long$VCSN.Agent <- as.character(dummy_df.long$VCSN.Agent)
+  dummy_df.long$month <- as.character(dummy_df.long$month)
+
+  monthly.checkdata1 <- dplyr::filter(monthly.checkdata, VCSN.Agent %in% vcsn.vector)
+  monthly.checkdata1$VCSN.Agent <- as.character(monthly.checkdata1$VCSN.Agent)
+  monthly.checkdata1$month <- as.character(monthly.checkdata1$month)
+
+  dummy_df.long <- dummy_df.long[, 4:6]
+  names(dummy_df.long) <- c("VCSN.Agent", "month", "d18O.Linear.jack")
+  head(dummy_df.long)
+  tail(dummy_df.long)
+
+  jacked.data <- dplyr::inner_join(monthly.checkdata1, dummy_df.long,
+    by = c("VCSN.Agent" = "VCSN.Agent", "month" = "month")
+  )
+
+  jacked.data$Linear.resid <- jacked.data$d18O.Linear.jack - jacked.data$meas.18O.mean
+
+  resids.frame <- jacked.data
+  resids.frame <- left_join(resids.frame,
+    vcsn.agent.locations1.subset,
+    by = c("VCSN.Agent" = "VCSN.Agent")
+  )
+  vcsn.mean$Agent <- as.character(vcsn.mean$Agent)
+  resids.frame <- left_join(resids.frame,
+    vcsn.mean,
+    by = c("VCSN.Agent" = "Agent")
+  )
+  resids.frame <- resids.frame[, c(1:8, 11:21)]
+
+  resids.frame.proj <- st_as_sf(resids.frame,
+    coords = c("vcsn.lon", "vcsn.lat"),
+    remove = FALSE,
+    crs = 4326
+  ) |>
+    st_transform(crs = crs_projected_target)
+
+  monthly <- unique(resids.frame.proj$month)
+
+  for (mth in monthly) {
+    resids.frame1 <- resids.frame.proj[resids.frame.proj$month == mth, ]
+    resid.trend <- gstat::variogram(Linear.resid ~ 1, resids.frame1)
+    trend.model <- gstat::fit.variogram(resid.trend, vgm(model = "Exp"))
+    krig.trend <- gstat::krige(
+      Linear.resid ~ 1,
+      resids.frame1,
+      nzgrid.long.format,
+      trend.model
+    )
+    krig.trend.sf <- krig.trend |> sf::st_transform(crs = agent.CRS)
+
+    kriging.row.index1 <- sf::st_nearest_feature(vcsn.agent.locations, krig.trend.sf)
+    new <- krig.trend.sf$var1.pred[kriging.row.index1] # Make a new column of residuals
+    vcsn.agent.locations_dummy[, ncol(vcsn.agent.locations_dummy) + 1] <- new # Append new column
+    colnames(vcsn.agent.locations_dummy)[ncol(vcsn.agent.locations_dummy)] <- paste0("Linear.resids.", mth) # Rename column name
+  }
+
+
+  fatLinear18Oframe <- dummy_df.long |>
+    dplyr::select(VCSN.Agent, month, d18O.Linear.jack) |> # select the named columns
+    spread(month, d18O.Linear.jack) |> # convert from long to wide format
+    ungroup() # ungroup
+
+  Linearresids <- as.data.frame(vcsn.agent.locations_dummy)
+  names(Linearresids)[names(Linearresids) == "Agent"] <- "VCSN.Agent"
+  Linearresids$VCSN.Agent <- as.character(Linearresids$VCSN.Agent)
+  fatLinear18Oframe$VCSN.Agent <- as.character(fatLinear18Oframe$VCSN.Agent)
+
+  Linearsubtract <- dplyr::left_join(Linearresids,
+    fatLinear18Oframe,
+    by = "VCSN.Agent"
+  )
+  Linearsubtract <- Linearsubtract[, c(1:17, 21:28, 18:20)]
+  Linearsubtract <- as.data.frame(Linearsubtract)
+
+  chop1 <- Linearsubtract[, 17:28]
+  chop2 <- Linearsubtract[, 5:16]
+  chop3 <- chop1 - chop2
+
+  Linearmodelfinal <- cbind((vcsn.agent.locations1[, c(1:4)]), chop3)
+  Linearmodel.df <- as.data.frame(Linearmodelfinal)
+  Linearmodel.df <- Linearmodel.df[, c(1:3, 16, 4:15)]
+  Linearmodel.df <- gather(Linearmodel.df, month, "Linear18O", 5:16, factor_key = TRUE)
+  Linearmodel.df$month <- str_replace(Linearmodel.df$month, "X", "")
+
+  new_frame <- dplyr::filter(Linearmodel.df, VCSN.Agent == vcsn.point) # Creating new value
+  new_col <- new_frame$Linear18O # Create new column
+  Linear.corr.df[, ncol(Linear.corr.df) + 1] <- new_col # Append new column
+  colnames(Linear.corr.df)[ncol(Linear.corr.df)] <- paste0("new", vcsn.point) # Appending new value to vector
+
+  print(paste0("finished ", i))
+}
+
+write.csv(Linear.corr.df, "Output/JackKnifeResults/correctedlinearmodel.csv")
+```
+
+
+The final test
+
+## Corrected kriging model
+
+This uses the universal kriging models above for amplitude, phase and offset, calculates a sinusoidal isoscape for each site (in the VCSN grid), calculates residuals at the n-1 sites, applies a residual correction layer with ordinary kriging, and generates a national isoscape based on n-1 sites. This repeats 51 times to create a data frame of independent predictions from this model. 
+
+
+```{r}
+acdf <- c(1:12)
+dummy_mat <- matrix(acdf, ncol = 1)
+krig.corr.df <- as.data.frame(dummy_mat)
+
+calc_precip_isotope <- function(julian.fraction) {                            
+  dummy_df$amp.jack*(sin((2*pi* julian.fraction) - dummy_df$phase.jack)) + dummy_df$offset.jack
+}
+
+for(i in 1:length(combine.vcsn.reg$Amplitude)){
+
+  # point we're pulling out at the end of each loop
+
+  vcsn.site <- st_drop_geometry((combine.vcsn.reg.proj[i, 19]))
+  vcsn.point <- as.character(vcsn.site[1, 1])
+
+  # All VCSN points without climate data
+  vcsn.agent.locations_dummy <- vcsn.agent.locations
+
+  #all vcsn locations and climate data
+  national.climate.summary_dummy<-national.climate.summary[,1:15]
+  national.climate.summary_dummy<-st_as_sf(national.climate.summary_dummy,
+                                    coords = c("VCSN.lon", "VCSN.lat"),
+                                    remove = FALSE,
+                                    crs = 4326) 
+ # dataframe of measurement sites and their climate data except the n-1 site
+ test.dataframe <- combine.vcsn.reg[-i, 1:20]
+ # vector of unique vcsn numbers in the n-1 dataframe
+ vcsn.vector <- unique(test.dataframe$VCSN.Agent)
+
+ # begin modelling
+ vcsn.site <- st_drop_geometry((combine.vcsn.reg.proj[i, 19]))
+ vcsn.point <- as.character(vcsn.site[1, 1])
+ v.trend3 <- gstat::variogram(Amplitude ~ SoilM, combine.vcsn.reg.proj[-i, ])
+
+ v.trend.model3 <- gstat::fit.variogram(v.trend3, vgm(model = "Exp"))
+
+ amp.loop.trend2 <- gstat::krige(
+   Amplitude ~ SoilM,
+   combine.vcsn.reg.proj[-i, ],
+   nzgrid.long.format,
+   v.trend.model3
+ )
+ 
+ amp.loop.trend.sf2 <- amp.loop.trend2 |> sf::st_transform(crs = agent.CRS)
+ vcsn.agent.locations100 <- vcsn.agent.locations
+ kriging.row.index <- sf::st_nearest_feature(national.climate.summary_dummy, amp.loop.trend.sf2)
+ vcsn.agent.locations100$Amplitude <-
+   amp.loop.trend.sf2$var1.pred[kriging.row.index]
+ vcsn.agent.locations100 <- st_drop_geometry(vcsn.agent.locations100)
+ vcsn.agent.locations100$Agent <- as.character(vcsn.agent.locations100$Agent)
+
+ amp.jack <- vcsn.agent.locations100$Amplitude
+                                            
+#phase
+v.trend3 <- gstat::variogram(phase ~ VP + height, combine.vcsn.reg.proj[-i,])
+
+v.trend.model3 <- gstat::fit.variogram(v.trend3, vgm(model = "Exp"))
+
+amp.loop.trend2 <- gstat::krige(phase ~ VP + height, 
+                           combine.vcsn.reg.proj[-i,], 
+                           nzgrid.long.format, 
+                           v.trend.model3)
+
+amp.loop.trend.sf2 <- amp.loop.trend2 |> sf::st_transform(crs = agent.CRS)
+vcsn.agent.locations100 <- vcsn.agent.locations
+kriging.row.index <- sf::st_nearest_feature(vcsn.agent.locations100, amp.loop.trend.sf2)
+vcsn.agent.locations100$phase <- amp.loop.trend.sf2$var1.pred[kriging.row.index]
+vcsn.agent.locations100 <- st_drop_geometry(vcsn.agent.locations100)
+vcsn.agent.locations100$Agent <- as.character(vcsn.agent.locations100$Agent)
+
+phase.jack<-vcsn.agent.locations100$phase
+
+#offset
+
+v.trend3 <- gstat::variogram(offset ~ VP + AnnualTempRange + ETmp + SoilM, combine.vcsn.reg.proj[-i,])
+
+v.trend.model3 <- gstat::fit.variogram(v.trend3, vgm(model = "Exp"))
+
+amp.loop.trend2 <- gstat::krige(offset ~ VP + AnnualTempRange + ETmp + SoilM, 
+                           combine.vcsn.reg.proj[-i,], 
+                           nzgrid.long.format, 
+                           v.trend.model3)
+
+amp.loop.trend.sf2 <- amp.loop.trend2 |>   sf::st_transform(crs = agent.CRS)
+vcsn.agent.locations100<-vcsn.agent.locations
+kriging.row.index <- sf::st_nearest_feature(vcsn.agent.locations100, amp.loop.trend.sf2)
+
+vcsn.agent.locations100$offset <- amp.loop.trend.sf2$var1.pred[kriging.row.index]
+vcsn.agent.locations100<-st_drop_geometry(vcsn.agent.locations100)
+vcsn.agent.locations100$Agent<-as.character(vcsn.agent.locations100$Agent)
+
+offset.jack<-vcsn.agent.locations100$offset
+
+VCSN.Agent<-national.climate.summary_dummy$VCSN.Agent
+dummy_df <- data.frame(amp.jack,phase.jack,offset.jack, VCSN.Agent)
+  
+  for (j in julian.days) {
+    new <- calc_precip_isotope(j) # Create new column of d18O predictions
+    dummy_df[, ncol(dummy_df) + 1] <- new # Append new column
+    colnames(dummy_df)[ncol(dummy_df)] <- paste0("new", j) # Rename column name
+  }
+
+  names(dummy_df) <- c("amplitude", "phase", "offset", "VCSN.Agent", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12")
+
+  dummy_df.long <- dummy_df |> gather(month, d18O, as.character(1:12), factor_key = TRUE)
+  dummy_df.long$VCSN.Agent <- as.character(dummy_df.long$VCSN.Agent)
+  dummy_df.long$month <- as.character(dummy_df.long$month)
+
+
+monthly.checkdata1<-dplyr::filter(monthly.checkdata, VCSN.Agent %in% vcsn.vector)
+
+monthly.checkdata1$VCSN.Agent<-as.character(monthly.checkdata1$VCSN.Agent)
+monthly.checkdata1$month<-as.character(monthly.checkdata1$month)
+dummy_df.long<-dummy_df.long[,4:6]
+names(dummy_df.long)<-c("VCSN.Agent", "month", "d18O.krig.jack")
+
+head(dummy_df.long)
+tail(dummy_df.long)
+
+jacked.data<-dplyr::inner_join(monthly.checkdata1, dummy_df.long, by=c('VCSN.Agent'='VCSN.Agent', 'month'='month'))
+
+
+jacked.data$krig.resid<-jacked.data$d18O.krig.jack - jacked.data$meas.18O.mean
+resids.frame<-jacked.data
+
+resids.frame<-left_join(resids.frame,
+                        vcsn.agent.locations1.subset,
+                        by=c('VCSN.Agent'='VCSN.Agent'))
+vcsn.mean$Agent<-as.character(vcsn.mean$Agent)
+resids.frame<-left_join(resids.frame, 
+                        vcsn.mean, 
+                        by = c('VCSN.Agent'='Agent'))
+resids.frame<-resids.frame[,c(1:8, 11:21)]
+
+
+resids.frame.proj <- st_as_sf(resids.frame,
+                                    coords = c("vcsn.lon", "vcsn.lat"),
+                                    remove = FALSE,
+                                    crs = 4326) |> 
+                      st_transform(crs = crs_projected_target)  
+
+monthly<-unique(resids.frame.proj$month)
+
+for (mth in monthly) {
+  resids.frame1 <- resids.frame.proj[resids.frame.proj$month == mth, ]
+  resid.trend <- gstat::variogram(krig.resid ~ 1, resids.frame1)
+  trend.model <- gstat::fit.variogram(resid.trend, vgm(model = "Exp"))
+  krig.trend <- gstat::krige(krig.resid ~ 1, 
+                           resids.frame1, 
+                           nzgrid.long.format, 
+                          trend.model)
+  krig.trend.sf <- krig.trend |>
+  sf::st_transform(crs = agent.CRS)
+  kriging.row.index1 <- sf::st_nearest_feature(vcsn.agent.locations, krig.trend.sf)
+  new <- krig.trend.sf$var1.pred[kriging.row.index1]                            # Make a new column of residuals 
+  vcsn.agent.locations_dummy[ , ncol(vcsn.agent.locations_dummy) + 1] <- new                  # Append new column
+  colnames(vcsn.agent.locations_dummy)[ncol(vcsn.agent.locations_dummy)] <-  paste0("krig.resids.", mth)  # Rename column name
+}
+
+
+  fatkrig18Oframe <- dummy_df.long |>                                                     
+    dplyr::select(VCSN.Agent, month,  d18O.krig.jack) |>     # select the named columns
+    spread(month, d18O.krig.jack) |>                                                    # convert from long to wide format
+    ungroup()                                                      # ungroup
+   
+  
+  krigresids<-as.data.frame(vcsn.agent.locations_dummy)
+  names(krigresids)[names(krigresids) == 'Agent'] <- "VCSN.Agent"
+  krigresids$VCSN.Agent<-as.character(krigresids$VCSN.Agent)
+  fatkrig18Oframe$VCSN.Agent<-as.character(fatkrig18Oframe$VCSN.Agent)
+  krigsubtract<-dplyr::left_join(krigresids,fatkrig18Oframe,  by = "VCSN.Agent")
+  krigsubtract<-krigsubtract[,c(1:17,21:28,18:20)]
+  krigsubtract<-as.data.frame(krigsubtract)
+  chop1<-krigsubtract[,17:28]
+  chop2<-krigsubtract[,5:16]
+  chop3<-chop1-chop2
+  krigmodelfinal<-cbind((vcsn.agent.locations1[,c(1:4)]), chop3)
+  krigmodel.df<-as.data.frame(krigmodelfinal)
+  krigmodel.df<-krigmodel.df[,c(1:3,16,4:15)]
+  krigmodel.df <- gather(krigmodel.df, month, "krig18O", 5:16, factor_key=TRUE)
+  krigmodel.df$month <- str_replace(krigmodel.df$month, "X", "")  
+
+  new_frame <-dplyr::filter(krigmodel.df, VCSN.Agent == vcsn.point)             # Creating new value
+  new_col<-new_frame$krig18O                      # Create new column
+  krig.corr.df[ , ncol(krig.corr.df) + 1] <- new_col                  # Append new column
+  colnames(krig.corr.df)[ncol(krig.corr.df)] <- paste0("new", vcsn.point)     # Appending new value to vector
+
+  print(paste0("finished ", i)) 
+}    # end of loop that stands at about line 1169
+
+write.csv(krig.corr.df, "Output/JackKnifeResults/correctedkrigmodel.csv")
+```
+
+
+# Create final files for plots and intercomparison of models
+
+Load in files created on the modelling computer, then make a data frame that holds the 'jacknife' monthly predictions for all six model options, plus the real data. Note this is just for the VCSN sites with real data. 
+
+```{r}
+#These three models haven't been attached to the dataframe of mean monthly values yet
+krig.corr.df <- read.csv("Output\JackKnifeResults\correctedkrigmodel.csv")
+Allen.corr.df <- read.csv("Output\JackKnifeResults\Allenmodelcorrected.csv")
+head(Linear.corr.df)
+
+# These three models have been attached to the dataframe of mean monthly values. They just need to be stuck together
+Allen.uncorr.df <- read.csv("Output\JackKnifeResults\Allen model jackknife results.csv")
+Lin.uncorr.df <- read.csv("Output\JackKnifeResults\Full linear model jackknife results.csv")
+Krig.uncorr.df <- read.csv("Output\JackKnifeResults\Full universal kriging model jackknife results.csv")
+
+
+
+# glue them together
+# First check they're all in the right order...
+
+all.equal(Krig.uncorr.df$VCSN.Agent, Allen.uncorr.df$VCSN.Agent)
+all.equal(Krig.uncorr.df$VCSN.Agent, Lin.uncorr.df$VCSN.Agent)
+all.equal(Krig.uncorr.df$month, Allen.uncorr.df$month)
+all.equal(Krig.uncorr.df$month, Lin.uncorr.df$month)
+# yep.
+
+All.uncorr.jacks <- Allen.uncorr.df[, 2:5]
+All.uncorr.jacks$d18O.Full.jack.uncorr <- Lin.uncorr.df$d18O.Full.jack
+All.uncorr.jacks$d18O.krig.jack.uncorr <- Krig.uncorr.df$d18O.Full.jack
+
+##OK, glued. 
+## Now, clean up the 'corrected' kriging results.
+
+krig.corr.df <- krig.corr.df[, c(3:53)]
+krig.corrected.df <- gather(krig.corr.df, VCSN.Agent, "krig.corrected.18O", 1:51, factor_key = TRUE)
+krig.corrected.df$VCSN.Agent <- str_replace(krig.corrected.df$VCSN.Agent, "new", "")
+krig.corrected.df$month <- rep(c(1:12), 51)
+head(krig.corrected.df)
+
+Linear.corr.df <- Linear.corr.df[, c(2:52)]
+Linear.corrected.df <- gather(Linear.corr.df, VCSN.Agent, "lin.corrected.18O", 1:51, factor_key = TRUE)
+Linear.corrected.df$VCSN.Agent <- str_replace(Linear.corrected.df$VCSN.Agent, "new", "")
+Linear.corrected.df$month <- rep(c(1:12), 51)
+head(Linear.corrected.df)
+
+Allen.corr.df <- Allen.corr.df[, c(3:53)]
+Allen.corrected.df <- gather(Allen.corr.df, VCSN.Agent, "Allen.corrected.18O", 1:51, factor_key = TRUE)
+Allen.corrected.df$VCSN.Agent <- str_replace(Allen.corrected.df$VCSN.Agent, "new", "")
+Allen.corrected.df$month <- rep(c(1:12), 51)
+head(Allen.corrected.df)
+
+## Glue them together
+All.corr.jacks <- Allen.corrected.df
+All.corr.jacks$lin.corrected.18O <- Linear.corrected.df$lin.corrected.18O
+All.corr.jacks$krig.corrected.18O <- krig.corrected.df$krig.corrected.18O
+
+#and attach them to the first three batches of model jackknife results
+
+
+All.uncorr.jacks$VCSN.Agent<-as.character(All.uncorr.jacks$VCSN.Agent)
+joindata.jack<-left_join(All.uncorr.jacks, All.corr.jacks, by=c('month'='month', 'VCSN.Agent'='VCSN.Agent'))
+
+#Then attach the Bowen predictions for these sites
+
+head(modeldata)
+bowendata<-modeldata[,c(1,5,13)]
+
+joindata.jack<-left_join(joindata.jack,
+                         bowendata, 
+                         by=c('month'='month', 'VCSN.Agent'='VCSN.Agent'))
+
+write.csv(joindata.jack, "Output/JackKnifeResults/allmonthly.jackknife.results.csv")
+```
+Now a dataframe to test which model best predicts our 'fitted' amplitudes across New Zealand when using jackknife. Then apply the original fitting function to each of our model 'time series'. 
+
+```{r}
+jack.checkdata<-checkdata[,1:5]
+jack.checkdata<-inner_join(jack.checkdata, joindata.jack, by=c('month'='month', 'VCSN.Agent' = 'VCSN.Agent'))
+
+#start curve fitting on one we already know
+
+mods.d18O.test <- iso_fit_sinusoidal_model(jack.checkdata, "VCSN.Agent", "Date", "meas.18O")
+params.d18O.test.only <-  iso_extract_parameters(mods.d18O.test, estimates.only = TRUE)
+head(params.d18O.test.only)
+#quick check
+plot(params.d18O.test.only$Amplitude~params.d18O.est.only$Amplitude)
+#All good. Now for the models. 
+
+#no need to refit the uncorrected models, these are amp.jack.soilMkrig, amp.jack.lm, amp.jack
+mods.d18O.Allen.corr <- iso_fit_sinusoidal_model(jack.checkdata, "VCSN.Agent", "Date", "Allen.corrected.18O")
+params.d18O.allencorr.only <- iso_extract_parameters(mods.d18O.Allen.corr, estimates.only = TRUE)
+
+mods.d18O.full.corr <- iso_fit_sinusoidal_model(jack.checkdata, "VCSN.Agent", "Date", "lin.corrected.18O")
+params.d18O.lincorr.only <- iso_extract_parameters(mods.d18O.full.corr, estimates.only = TRUE)
+
+mods.d18O.krig.corr <- iso_fit_sinusoidal_model(jack.checkdata, "VCSN.Agent", "Date", "krig.corrected.18O")
+params.d18O.krigcorr.only <- iso_extract_parameters(mods.d18O.krig.corr, estimates.only = TRUE)
+
+mods.d18O.global <- iso_fit_sinusoidal_model(jack.checkdata, "VCSN.Agent", "Date", "global18O")
+params.d18O.global.only <- iso_extract_parameters(mods.d18O.global, estimates.only = TRUE)
+
+# Lots of "! failed to converge in 20 steps" on the last (global) model. Oddly, this problem even arises when I try to refit to the perfect sinusoidal models from the first three isoscapes (which are now taken directly from the jackknife tests for amplitude).
+
+jack.checkdata2 <- data.frame(params.d18O.allencorr.only$Site, params.d18O.est.only$Amplitude, amp.jack, amp.jack.lm, amp.jack.soilMkrig, params.d18O.allencorr.only$Amplitude, params.d18O.lincorr.only$Amplitude, params.d18O.krigcorr.only$Amplitude, params.d18O.global.only$Amplitude)
+
+names(jack.checkdata2) <- c("Site", "original.fitted.amp", "Allen.amp", "lin.amp", "soilMkrig.amp", "All.corr.amp", "lin.corr.amp", "soilMkrig.corr.amp", "global.amp")
+amp.check.final <- jack.checkdata2
+head(amp.check.final)
+rm(jack.checkdata2)
+
+write.csv(amp.check.final, "Output/JackKnifeResults/amp.check.final.csv")
+```
+
+Provide a rough estimate of where we might best be able to use seasonal precip. amplitudes. 
+
+```{r}
+ampstats<- dplyr::filter(params.d18O.full, term  == 'Amplitude')
+ampstats$amprely<-ampstats$std.error / ampstats$estimate
+ampstats$Site-combine.vcsn.reg$Site
+
+combine.vcsn.reg$amprely<-ampstats$amprely
+```
+
+Do a regression tree 
+
+```{r}
+tree.model1 <- tree::tree(amprely ~ SoilM + height +
+                 ETmp + MSLP + PET + Rad + 
+                 Rain_bc + 
+                 RH + 
+                 VP + Wind + AnnualTempRange, 
+                 data = combine.vcsn.reg)
+plot(tree.model1)
+text(tree.model1)
+```
+remake combine.vcsn.reg.proj
+
+```{r data sf format}
+combine.vcsn.reg.proj <- st_as_sf(combine.vcsn.reg,
+                                    coords = c("VCSN.lon", "VCSN.lat"),
+                                    remove = FALSE,
+                                    crs = 4326) |> 
+                      st_transform(crs = crs_projected_target)  
+```
+
+Make a regression kriging map using SoilM
+
+```{r}
+v.trend <- gstat::variogram(amprely ~  ETmp + PET, combine.vcsn.reg.proj)
+plot(v.trend, plot.numbers = TRUE)
+```
+AnnualTempRange + Rain_bc + VP
+
+```{r}
+
+v.trend.model <- gstat::fit.variogram(v.trend, vgm(model = "Exp"))
+plot(v.trend, v.trend.model, plot.numbers = TRUE)
+save(v.trend.model, file = "Output/JackKnifeResults/v.trend.model.RData")
+```
+
+Apply trend kriging model over NZ. 
+
+```{r trend model kriging}
+krig.trend <- gstat::krige(amprely ~ ETmp + PET, 
+                           combine.vcsn.reg.proj, 
+                           nzgrid.long.format, 
+                           v.trend.model)
+save(krig.trend, file = "Output/JackKnifeResults/krig.trend.RData")
+```
+
+Make a map
+
+```{r plot amplitude kriging with trend}
+krig.trend.stars <- stars::st_as_stars(krig.trend)
+
+plot.amplitude.kriging.trend <- 
+ggplot() + 
+  geom_stars(data = krig.trend.stars, aes(fill = var1.pred, x = x, y = y)) + 
+  geom_sf(data = combine.vcsn.reg.proj) +
+  coord_sf(expand = FALSE) +
+  scale_fill_continuous(type = "viridis") +
+  labs(fill = "StdE/AMp") +  
+  xlab("Longitude") +
+  ylab("Latitude") +
+  ggtitle("Standard error/Amplitude: universal kriging interpolation") 
+
+plot.amplitude.kriging.trend
+```
+
+
+# Saved data
+
+Everything, jus to be on the safe side.
+
+```{r}
+save.image(file = "Output/Data/JackKnifingEveryThing.RData")
+```
+

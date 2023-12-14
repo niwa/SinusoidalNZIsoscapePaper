@@ -1,0 +1,842 @@
+---
+title: "Precipitation sinusoidal isocape model: kriging over NZ of sinusoidal parameters"
+author: "Andy McKenzie (NIWA), Bruce Dudley (NIWA)"
+date: "`r format(Sys.Date(), '%d %B, %Y')`"
+output:
+  html_document: 
+    theme: united
+    code_folding: show
+    toc: yes
+    toc_float:
+      collapsed: true   
+    fig_caption: yes
+    number_sections: yes
+    df_print: kable
+  word_document: 
+    toc: yes
+  pdf_document: 
+    toc: yes
+    fig_caption: yes
+    number_sections: yes
+editor_options:
+  chunk_output_type: console
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+# Global options
+#
+# echo = TRUE. Show the code
+# comment = "". Don't put anything in front of results from code
+# warning = FALSE. Don't display warning messages
+# cache = TRUE. Only process new code when you knit
+# dev = 'png'. Save graphics in figure folder as png
+# fig.height = 5. Height of figures (in inches)
+
+unlink("Output/KrigingResults", recursive = TRUE)
+dir.create("Output/KrigingResults")
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  comment = "",
+  warning = FALSE,
+  message = FALSE,
+  cache = FALSE,
+  dev = "png", dpi = 300,
+  fig.height = 5
+)
+
+
+# tidyverse packages
+library(tidyr)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(lubridate)
+
+
+# https://docs.stadiamaps.com/guides/migrating-from-stamen-map-tiles/#ggmap
+# devtools::install_github("stadiamaps/ggmap”)
+library(ggmap) # get_stamenmap() & ggmap
+# register_stadiamaps("ff428357-71cc-4a08-8912-9111113265ec", write = TRUE)
+
+
+# For map plotting
+library(sf)
+library(stars)
+
+# devtools::install_github("ropensci/rnaturalearthhires")
+library(rnaturalearthhires)
+library(rnaturalearth)
+library(rnaturalearthdata)
+
+library(ggrepel) # geom_text_repel()
+library(cowplot) # multiple plots for a figure
+
+# model kriging
+library(gstat)
+
+# For reading in global isotope prediction maps
+# library(raster)
+
+library(flextable)
+set_flextable_defaults(big.mark = "")
+
+
+
+
+rm(list = ls())
+
+source("auxiliary.code.R")
+
+ft <- function(input.data, caption = "", num.rows = Inf) {
+  ft <- input.data |>
+    slice_head(n = num.rows) |>
+    flextable() |>
+    autofit() |>
+    theme_zebra() |>
+    set_caption(caption)
+  ft
+}
+```
+
+
+# Load in data
+
+```{r}
+# site summary for estimated sinusoidal parameters
+load("Output/Data/combine.data.RData")
+dim(combine.data)  
+names(combine.data)
+
+# sites summary for estimated sinusoidal parameters plus predicted
+# values from regressions
+load("Output/Data/combine.vcsn.reg.RData")
+dim(combine.vcsn.reg)  
+names(combine.vcsn.reg)
+
+# agent locations (lat/lon)
+load("Output/Data/vcsn.agent.locations.RData")
+dim(vcsn.agent.locations)  
+names(vcsn.agent.locations)
+
+# mean value of climate parameters at agent locations
+load("Output/Data/vcsn.mean.RData")
+glimpse(vcsn.mean)
+
+# Mean value of climate data at an agent location.
+#  - first generated in 00-isoscape-data-preparation.Rmd
+#  - modified in 01-isoscape-model-fits-regression.Rmd and output from there
+load(file = "Output/Data/national.climate.summary.01.output.RData")
+glimpse(national.climate.summary)
+```
+
+
+# Prediction over New Zealand 2 - regression kriging
+
+
+## Base NZ map
+
+A starting base map of class *sf* is used in a geographic CRS i.e.
+coordinates of lat/lon in degrees (not meters)
+
+```{r data base NZ map sf}
+nzmap <- rnaturalearth::ne_countries(scale = 'large', 
+                      country = "New Zealand",
+                      returnclass = 'sf')
+
+st_is_longlat(nzmap)
+st_crs(nzmap)$proj4string
+```
+
+
+
+Crop the starting base map to exclude the Chatham Islands, as above.
+Also for Kriging prediction, a projected CRS is needed, and New Zealand
+Transverse Mercator 2000 (NZTM 2000) is chosen for this.
+
+```{r data base NZ map in projected CRS}
+crs_projected_target <- "EPSG:2193"
+
+nzmap.proj <- nzmap |> 
+  st_crop(xmin = 164.8, xmax = 179.4, ymin = -47.7, ymax = -33.8) |> 
+  st_transform(crs = crs_projected_target)
+```
+
+```{r plot NZ map cropped and projected CRS}
+ggplot() +  
+  geom_sf(data = nzmap.proj, fill = "darkgreen") +
+  ggtitle("Cropped NZ map: NZ Transverse Mercator 2000")
+```
+
+Grid for interpolating on. Starting with the projected NZ map, setup a
+grip with 5 km grid cells ("pixels")
+
+```{r data nz grid}
+nzgrid <- nzmap.proj |> 
+  sf::st_bbox() |>
+  stars::st_as_stars(dx = 5000) |>
+  sf::st_crop(nzmap.proj) 
+
+nzgrid
+```
+
+
+
+## VCSN data in the projected CRS
+
+The VCSN data set is made into an sf object with the target
+CRS: NZTM 2000 (i.e. same as the base NZ map).
+
+
+```{r data sf format}
+combine.vcsn.reg.proj <- st_as_sf(combine.vcsn.reg,
+                                    coords = c("VCSN.lon", "VCSN.lat"),
+                                    remove = FALSE,
+                                    crs = 4326) |> 
+                      st_transform(crs = crs_projected_target)  
+```
+
+
+| Name                  | Comment                                                                                   |
+|-----------------------|-------------------------------------------------------------------------------------------|
+| combine.vcsn          | site, estimated sinusoidal parameters, mean value of VCSN variable over 2007-2009 (inclusive)                                                   |
+| combine.vcsn.reg      | removed some VCSN variables that are highly linearly correlated with other VCSN variables |
+| combine.vcsn.reg.proj | Turn combine.vcsn.reg into an sf object                                                   |
+
+: What the various VCSN data set are.
+
+
+
+## Amplitude prediction
+
+```{r plot NZ project map with amplitude, fig.cap="Estimated amplitude at sites."}
+plot.amplitude.spatial <- iso_plot_spatial_static(combine.data, "Site", "lat", "lon", "Amplitude")
+plot.amplitude.spatial
+```
+
+### Inverse distance weighting
+
+Warm-up with predicted values based on Inverse Distance Weighting (IDW).
+Values at sites match the measurements, with inverse weighting for
+interpolation elsewhere.
+
+```{r amplitude IDW interpolation}
+amp.IDW <- gstat::idw(Amplitude ~ 1, combine.vcsn.reg.proj, nzgrid)
+```
+
+```{r plot amplitude IDW}
+plot.amplitude.IDW <- 
+ggplot() + 
+  geom_stars(data = amp.IDW, aes(fill = var1.pred, x = x, y = y)) + 
+  geom_sf(data = combine.vcsn.reg.proj) +
+  coord_sf(expand = FALSE) +
+  scale_fill_continuous(type = "viridis") +
+  labs(fill = "Amplitude") +  
+  xlab("Longitude") +
+  ylab("Latitude") +
+  ggtitle("Amplitude: IDW interpolation")  
+plot.amplitude.IDW
+```
+
+
+### Kriging constant model
+
+```{r  constant variogram}
+v.constant <- gstat::variogram(Amplitude ~ 1, combine.vcsn.reg.proj)
+plot(v.constant, plot.numbers = TRUE)
+```
+
+
+Function variogram chooses default for maximum distance (cutoff: one
+third of the length of the bounding box diagonal) and (constant)
+interval widths (width: cutoff divided by 15).
+
+These defaults can be changed, e.g. by
+
+```{r variogram variation}
+v0 <- gstat::variogram(Amplitude ~ 1, 
+                       combine.vcsn.reg.proj, 
+                       cutoff = 1E6,
+                       width = 30000)
+plot(v0, plot.numbers = TRUE)
+```
+
+Fitting an exponential variogram for all values of h.
+
+```{r plot constant model variogram, eval=FALSE, include=FALSE}
+v.constant.model <- gstat::fit.variogram(v.constant, 
+                                 vgm(psill = 1, 
+                                     model = "Exp", 
+                                     range = 500000,
+                                     nugget = 0.05))
+plot(v.constant, v.constant.model, plot.numbers = TRUE)
+```
+
+
+```{r plot constant model variogram default}
+v.constant.model <- gstat::fit.variogram(v.constant, vgm(model = "Exp"))
+plot(v.constant, v.constant.model, plot.numbers = TRUE)
+# fitted model used in river site analysis to calculate young water fraction
+#   ywf = river site amplitude (fit to measured values)/ "river site catchment weighted precipitation amplitude"
+#   Where the precipitation amplitude is predicted at points within a river site
+#   catchment, then the weighted average by rainfall taken
+save(v.constant.model, file = "Output/KrigingResults/v.constant.model.RData")
+```
+
+Apply constant kriging model over NZ. 
+
+```{r constant model kriging}
+krig.constant <- gstat::krige(Amplitude ~ 1, 
+                           combine.vcsn.reg.proj, 
+                           nzgrid, 
+                           v.constant.model)
+save(krig.constant, file = "Output/KrigingResults/krig.constant.RData")
+```
+
+
+
+```{r plot amplitude kriging}
+plot.amplitude.kriging <- 
+ggplot() + 
+  geom_stars(data = krig.constant, aes(fill = var1.pred, x = x, y = y)) + 
+  geom_sf(data = combine.vcsn.reg.proj) +
+  coord_sf(expand = FALSE) +
+  scale_fill_continuous(type = "viridis") +
+  labs(fill = "Amplitude") +  
+  xlab("Longitude") +
+  ylab("Latitude") +
+  ggtitle("Amplitude: ordinary kriging interpolation") 
+plot.amplitude.kriging
+```
+
+
+
+```{r plot amplitude kriging variance}
+plot.amplitude.kriging.variance <- 
+ggplot() + 
+  geom_stars(data = krig.constant, aes(fill = var1.var, x = x, y = y)) + 
+  geom_sf(data = combine.vcsn.reg.proj) +
+  coord_sf(expand = FALSE) +
+  scale_fill_viridis_c(option = "inferno") +
+  labs(fill = "Variance") +  
+  xlab("Longitude") +
+  ylab("Latitude") +
+  ggtitle("Amplitude: kriging interpolation variance") 
+plot.amplitude.kriging.variance
+```
+
+
+
+
+#### Summary plots for constant kriging
+
+```{r plot amplitude IDW and kriging, fig.height=6}
+cowplot::plot_grid(plot.amplitude.spatial,  plot.amplitude.IDW,
+plot.amplitude.spatial, plot.amplitude.kriging)
+```
+
+
+```{r plot amplitude IDW and kriging variance, fig.height=6}
+cowplot::plot_grid(plot.amplitude.kriging, plot.amplitude.kriging.variance)
+```
+
+
+
+
+### Kriging trend model
+
+As above, but put in some trend variables (say soil moisture: SoilM) for the
+kriging, which needs to assigned to each grid point to predict over NZ. 
+
+This (below) is now done above, no need to repeat here
+
+```{r data read all VCSN data 2007 to 2022}
+# It takes a while to retreive the data, so is done once and the data saved
+#
+# vcsn.2007.2009 <- vcsn_combine_daily_data(VCSN.directory, years = 2007:2009)
+# save(vcsn.2007.2009, file = "ProcessedData/vcsn.2007.2009.RData")
+
+#load("output/vcsn.2007.2009.RData")
+
+#vcsn.mean <- vcsn.2007.2009 |>
+#  dplyr::select(-Tmin, -TMax, 
+#                -Tmin_N, - Tmax_N, 
+#                -Rain)  |>
+#  rename(lat = Lat, lon = Longt) |>
+#  group_by(Agent, lat, lon) |>
+#  summarise(across(.cols = MSLP:Rain_bc, .fns = ~mean(.x, na.rm = TRUE))) 
+
+# it's big, best to remove it
+#rm(vcsn.2007.2009)
+
+target.crs <- sf::st_crs(nzgrid)
+
+vcsn.mean.sf <- vcsn.mean |>
+  sf::st_as_sf(coords = c("lon", "lat"), 
+             remove = FALSE,
+             crs = 4326) |>
+  sf::st_transform(crs = target.crs)
+```
+
+
+
+```{r data nz find nearest VCSN mean value}
+nzgrid.sf <- st_as_sf(nzgrid)
+nzgrid.long.format <- st_join(nzgrid.sf, vcsn.mean.sf, join = st_nearest_feature) 
+
+nzgrid.long.format |> slice_head(n = 5)
+```
+
+
+```{r}
+v.trend <- gstat::variogram(Amplitude ~ SoilM, combine.vcsn.reg.proj)
+plot(v.trend, plot.numbers = TRUE)
+```
+
+```{r}
+v.trend.model <- gstat::fit.variogram(v.trend, vgm(model = "Exp"))
+plot(v.trend, v.trend.model, plot.numbers = TRUE)
+save(v.trend.model, file = "Output/KrigingResults/v.trend.model.RData")
+```
+
+
+
+Apply trend kriging model over NZ. 
+
+```{r trend model kriging}
+krig.trend <- gstat::krige(Amplitude ~ SoilM, 
+                           combine.vcsn.reg.proj, 
+                           nzgrid.long.format, 
+                           v.trend.model)
+save(krig.trend, file = "Output/KrigingResults/krig.trend.RData")
+```
+
+
+Second universal kriging prediction using Rad and AnnualTempRange
+
+```{r}
+v.trend2 <- gstat::variogram(Amplitude ~ Rad + AnnualTempRange, combine.vcsn.reg.proj)
+plot(v.trend2, plot.numbers = TRUE)
+```
+
+```{r}
+v.trend.model2 <- gstat::fit.variogram(v.trend2, vgm(model = "Exp"))
+plot(v.trend2, v.trend.model2, plot.numbers = TRUE)
+```
+
+```{r trend model kriging2}
+amp.krig.trend <- gstat::krige(Amplitude ~ Rad + AnnualTempRange, 
+                           combine.vcsn.reg.proj, 
+                           nzgrid.long.format, 
+                           v.trend.model2)
+save(amp.krig.trend, file = "Output/KrigingResults/amp.krig.trend.RData")
+```
+
+
+First universal kriging plot (using SoilM).
+
+```{r plot amplitude kriging with trend}
+krig.trend.stars <- stars::st_as_stars(krig.trend)
+
+plot.amplitude.kriging.trend <- 
+  ggplot() + 
+  geom_stars(data = krig.trend.stars, aes(fill = var1.pred, x = x, y = y)) + 
+  geom_sf(data = combine.vcsn.reg.proj) +
+  coord_sf(expand = FALSE) +
+  scale_fill_continuous(type = "viridis") +
+  labs(fill = "Amplitude") +  
+  xlab("Longitude") +
+  ylab("Latitude") +
+  ggtitle("Amplitude: universal kriging interpolation using SoilM") 
+
+plot.amplitude.kriging.trend
+```
+
+Second universal kriging plot (using Rad and AnnualTempRange)
+
+```{r plot amplitude kriging with trend2}
+krig.trend.stars2 <- stars::st_as_stars(amp.krig.trend)
+
+plot.amplitude.kriging.trend2 <- 
+  ggplot() + 
+  geom_stars(data = krig.trend.stars2, aes(fill = var1.pred, x = x, y = y)) + 
+  geom_sf(data = combine.vcsn.reg.proj) +
+  coord_sf(expand = FALSE) +
+  scale_fill_continuous(type = "viridis") +
+  labs(fill = "Amplitude") +  
+  xlab("Longitude") +
+  ylab("Latitude") +
+  ggtitle("Amplitude: universal kriging interpolation using Rad and TempRange") 
+
+plot.amplitude.kriging.trend2
+```
+
+```{r plot compare two universal models for amplitude }
+cowplot::plot_grid(plot.amplitude.kriging.trend, plot.amplitude.kriging.trend2)
+```
+
+
+```{r plot compare ordinary vs universal for amplitude II}
+cowplot::plot_grid(plot.amplitude.kriging, plot.amplitude.kriging.trend)
+```
+
+### Check of predictions for amplitude from universal kriging using SoilM against fitted site amplitudes
+
+```{r}
+slice_head(vcsn.agent.locations, n = 3)
+```
+
+```{r}
+load("Output/KrigingResults/krig.trend.RData")
+slice_head(krig.trend, n = 3)
+```
+
+Make the kriging simple features object have the same CRS as that of the vcsn agents simple features object
+
+```{r}
+agent.CRS <- sf::st_crs(vcsn.agent.locations)
+
+krig.trend.sf <- krig.trend |>
+  sf::st_transform(crs = agent.CRS)
+```
+
+For the vcsn agent locations find the nearest point on the grid used for the kriging interpolation. 
+
+```{r}
+vcsn.agent.locations2 <- vcsn.agent.locations
+kriging.row.index <- sf::st_nearest_feature(vcsn.agent.locations, krig.trend.sf)
+vcsn.agent.locations2$Amplitude <- krig.trend.sf$var1.pred[kriging.row.index]
+slice_head(vcsn.agent.locations2, n = 3)
+```
+    
+ 
+Check that this looks to be working with some plots. Firstly, the kriging interpolation plot. 
+
+First the amplitude at vcsn agent points. 
+    
+```{r}
+plot(vcsn.agent.locations2["Amplitude"])
+```
+
+Now compare the regression modeled amplitude grids against those using regression kriging (using Soil moisture as a predictor). 
+    
+```{r}
+Andyamps <- as.data.frame(vcsn.agent.locations2)
+Andyamps <- subset(Andyamps, select = -c(2, 3))
+names(Andyamps) <- c("VCSN.Agent", "geometry", "Amplitude.krig")
+Andyamps$VCSN.Agent <- as.character(Andyamps$VCSN.Agent)
+
+national.climate.summary$VCSN.Agent <- as.character(national.climate.summary$VCSN.Agent)
+combine.vcsn.amps <- dplyr::inner_join(national.climate.summary, Andyamps, by = "VCSN.Agent")
+head(combine.vcsn.amps)
+
+ggplot(combine.vcsn.amps, aes(x = amp.pred, y = Amplitude.krig)) +
+  geom_point(colour = "blue")
+```
+
+
+
+## Offset krigging prediction
+
+
+
+```{r plot NZ project map with offset, fig.cap="Estimated offset at sites."}
+plot.offset.spatial <- iso_plot_spatial_static(combine.data, "Site", "lat", "lon", "offset")
+plot.offset.spatial
+```
+
+
+```{r  constant variogram offset}
+v.constant.offset <- gstat::variogram(offset ~ 1, combine.vcsn.reg.proj)
+plot(v.constant, plot.numbers = TRUE)
+
+v.constant.model.offset <- gstat::fit.variogram(v.constant.offset, vgm(model = "Exp"))
+plot(v.constant.offset, v.constant.model.offset, plot.numbers = TRUE)
+```
+
+Apply constant kriging model over NZ. 
+
+```{r}
+krig.constant.offset <- gstat::krige(offset ~ 1, 
+                           combine.vcsn.reg.proj, 
+                           nzgrid, 
+                           v.constant.model.offset)
+```
+
+
+
+```{r plot offset kriging}
+plot.offset.kriging <- 
+ggplot() + 
+  geom_stars(data = krig.constant.offset, aes(fill = var1.pred, x = x, y = y)) + 
+  geom_sf(data = combine.vcsn.reg.proj) +
+  coord_sf(expand = FALSE) +
+  scale_fill_continuous(type = "viridis") +
+  labs(fill = "Offset") +  
+  xlab("Longitude") +
+  ylab("Latitude") +
+  ggtitle("Offset: ordinary kriging interpolation") 
+plot.offset.kriging
+```
+
+
+```{r plot offset kriging variance}
+plot.offset.kriging.variance <- 
+ggplot() + 
+  geom_stars(data = krig.constant.offset, aes(fill = var1.var, x = x, y = y)) + 
+  geom_sf(data = combine.vcsn.reg.proj) +
+  coord_sf(expand = FALSE) +
+  scale_fill_viridis_c(option = "inferno") +
+  labs(fill = "Variance") +  
+  xlab("Longitude") +
+  ylab("Latitude") +
+  ggtitle("Offset: kriging interpolation variance") 
+plot.offset.kriging.variance
+```
+
+
+
+Then universal kriging prediction using best VCSN predictors from tree regressions (VP, AnnualTempRange, ETmp and SoilM)
+
+
+```{r}
+v.trend.offset <- gstat::variogram(offset ~ VP + AnnualTempRange + ETmp + SoilM,
+                             combine.vcsn.reg.proj)
+v.trend.offset.model <- gstat::fit.variogram(v.trend.offset, 
+                                             vgm(model = "Exp"))
+plot(v.trend.offset, v.trend.offset.model, plot.numbers = TRUE)
+```
+
+
+```{r}
+offset.krig.trend <- gstat::krige(offset ~ VP + AnnualTempRange + ETmp + SoilM, 
+                           combine.vcsn.reg.proj, 
+                           nzgrid.long.format, 
+                           v.trend.offset.model)
+save(offset.krig.trend, file = "Output/KrigingResults/offset.krig.trend.RData")
+```
+
+
+Universal kriging plot (using VP + AnnualTempRange + ETmp + SoilM)
+
+```{r}
+offset.krig.trend.stars <- stars::st_as_stars(offset.krig.trend)
+
+plot.offset.kriging.trend <- 
+  ggplot() + 
+    geom_stars(data = offset.krig.trend.stars, aes(fill = var1.pred)) + 
+    geom_sf(data = combine.vcsn.reg.proj) +
+    coord_sf(expand = FALSE) +
+    scale_fill_continuous(type = "viridis") +
+    labs(fill = "Offset") +  
+    xlab("Longitude") +
+    ylab("Latitude") +
+    ggtitle("Offset: universal kriging interpolation")
+
+plot.offset.kriging.trend
+```
+
+
+```{r plot offset fitted and kriging, fig.height=6}
+cowplot::plot_grid(plot.offset.spatial,  plot.offset.kriging, plot.offset.kriging.trend)
+```
+
+
+
+
+
+## Phase krigging prediction
+
+
+
+```{r plot NZ project map with phase, fig.cap="Estimated phase at sites."}
+plot.phase.spatial <- iso_plot_spatial_static(combine.data, "Site", "lat", "lon", "phase")
+plot.phase.spatial
+```
+
+
+
+```{r  constant variogram phase}
+v.constant.phase <- gstat::variogram(phase ~ 1, combine.vcsn.reg.proj)
+plot(v.constant, plot.numbers = TRUE)
+
+v.constant.model.phase <- gstat::fit.variogram(v.constant.phase, vgm(model = "Exp"))
+plot(v.constant.phase, v.constant.model.phase, plot.numbers = TRUE)
+```
+
+Apply constant kriging model over NZ. 
+
+```{r constant model kriging phase}
+krig.constant.phase <- gstat::krige(phase ~ 1, 
+                           combine.vcsn.reg.proj, 
+                           nzgrid, 
+                           v.constant.model.phase)
+```
+
+
+
+```{r plot phase kriging}
+plot.phase.kriging <- 
+ggplot() + 
+  geom_stars(data = krig.constant.phase, aes(fill = var1.pred, x = x, y = y)) + 
+  geom_sf(data = combine.vcsn.reg.proj) +
+  coord_sf(expand = FALSE) +
+  scale_fill_continuous(type = "viridis") +
+  labs(fill = "phase") +  
+  xlab("Longitude") +
+  ylab("Latitude") +
+  ggtitle("Phase: ordinary kriging interpolation") 
+plot.phase.kriging
+```
+
+
+```{r plot phase kriging variance}
+plot.phase.kriging.variance <- 
+ggplot() + 
+  geom_stars(data = krig.constant.phase, aes(fill = var1.var, x = x, y = y)) + 
+  geom_sf(data = combine.vcsn.reg.proj) +
+  coord_sf(expand = FALSE) +
+  scale_fill_viridis_c(option = "inferno") +
+  labs(fill = "Variance") +  
+  xlab("Longitude") +
+  ylab("Latitude") +
+  ggtitle("Phase: kriging interpolation variance") 
+plot.offset.kriging.variance
+```
+
+
+Then universal kriging prediction using best VCSN predictors from tree regressions (VP and height)
+
+
+
+```{r}
+v.trend.phase <- gstat::variogram(phase ~ VP + height,
+                             combine.vcsn.reg.proj)
+v.trend.phase.model <- gstat::fit.variogram(v.trend.phase,  
+                                             vgm(model = "Exp"))
+plot(v.trend.phase, v.trend.phase.model, plot.numbers = TRUE)
+```
+
+
+
+```{r trend model kriging for offset}
+phase.krig.trend <- gstat::krige(phase ~ VP + height, 
+                           combine.vcsn.reg.proj, 
+                           nzgrid.long.format, 
+                           v.trend.phase.model)
+save(phase.krig.trend, file = "Output/KrigingResults/phase.krig.trend.RData")
+```
+
+
+A variation on the trend variables used. 
+
+```{r}
+v.trend2 <- gstat::variogram(phase ~ VCSN.lat + VCSN.lon, combine.vcsn.reg.proj)
+plot(v.trend2, plot.numbers = TRUE)
+
+v.trend2.phase <- gstat::fit.variogram(v.trend2, vgm(model = "Exp"))
+plot(v.trend2, v.trend2.phase, plot.numbers = TRUE)
+```
+
+
+Universal kriging plot (phase) using VP and height.
+
+```{r plot offset kriging with trend}
+phase.krig.trend.stars <- stars::st_as_stars(phase.krig.trend)
+
+plot.phase.kriging.trend <- 
+  ggplot() + 
+    geom_stars(data = phase.krig.trend.stars, aes(fill = var1.pred)) + 
+    geom_sf(data = combine.vcsn.reg.proj) +
+    coord_sf(expand = FALSE) +
+    scale_fill_continuous(type = "viridis") +
+    labs(fill = "Phase") +  
+    xlab("Longitude") +
+    ylab("Latitude") +
+    ggtitle("Phase: universal kriging interpolation") 
+
+plot.phase.kriging.trend
+```
+
+Some phase maps made using the two different kriging  approaches
+
+```{r plot phase fittted and kriging, fig.height=6}
+cowplot::plot_grid(plot.phase.spatial, 
+                   plot.phase.kriging,
+                   plot.phase.kriging.trend)
+```
+
+#Plots of all three regression kriging interpolations: Amplitude, phase and offset. 
+```{r}
+cowplot::plot_grid(plot.amplitude.kriging.trend, 
+                   plot.phase.kriging.trend,
+                   plot.offset.kriging.trend)
+```
+
+
+
+
+#Add kriging model predictions to VCSN grid
+
+First make .sf objects
+
+```{r}
+agent.CRS <- sf::st_crs(vcsn.agent.locations)
+
+amp.krig.trend.sf <- krig.trend |>
+  sf::st_transform(crs = agent.CRS)
+
+phase.trend.sf <- phase.krig.trend |>
+  sf::st_transform(crs = agent.CRS)
+
+offset.trend.sf <- offset.krig.trend |>
+  sf::st_transform(crs = agent.CRS)
+```
+
+Then the extraction
+
+```{r}
+vcsn.agent.locations3<-vcsn.agent.locations
+kriging.row.index1 <- sf::st_nearest_feature(vcsn.agent.locations, amp.krig.trend.sf)
+vcsn.agent.locations3$Amplitude <- amp.krig.trend.sf$var1.pred[kriging.row.index1]
+
+kriging.row.index2 <- sf::st_nearest_feature(vcsn.agent.locations, phase.trend.sf)
+vcsn.agent.locations3$Phase <- phase.trend.sf$var1.pred[kriging.row.index2]
+
+kriging.row.index3 <- sf::st_nearest_feature(vcsn.agent.locations, offset.trend.sf)
+vcsn.agent.locations3$Offset <- offset.trend.sf$var1.pred[kriging.row.index3]
+
+slice_head(vcsn.agent.locations3, n = 3)
+```
+
+
+
+Then attach kriging predictions to the data frame of climate data and predictions from linear models 
+    
+```{r}
+national.climate.summary$krig.amp.pred    <- vcsn.agent.locations3$Amplitude
+national.climate.summary$krig.phase.pred  <- vcsn.agent.locations3$Phase
+national.climate.summary$krig.offset.pred <- vcsn.agent.locations3$Offset
+
+head(national.climate.summary)
+plot(national.climate.summary$krig.amp.pred, national.climate.summary$amp.pred)
+```
+
+
+# Saved data
+
+
+```{r}
+save(national.climate.summary, file = "Output/Data/national.climate.summary.02.output.RData")
+dim(national.climate.summary)
+names(national.climate.summary)
+```
+
+
+```{r}
+save(nzgrid.long.format, file = "Output/Data/nzgrid.long.format.RData")
+glimpse(nzgrid.long.format)
+```
+

@@ -1,0 +1,692 @@
+---
+title: "Precipitation sinusoidal isocape model: data preparation"
+author: "Andy McKenzie (NIWA), Bruce Dudley (NIWA)"
+date: "`r format(Sys.Date(), '%d %B, %Y')`"
+output:
+  html_document: 
+    theme: united
+    code_folding: show
+    toc: yes
+    toc_float:
+      collapsed: true   
+    fig_caption: yes
+    number_sections: yes
+    df_print: kable
+  word_document: 
+    toc: yes
+  pdf_document: 
+    toc: yes
+    fig_caption: yes
+    number_sections: yes
+editor_options:
+  chunk_output_type: console
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+# Global options
+#
+# echo = TRUE. Show the code
+# comment = "". Don't put anything in front of results from code
+# warning = FALSE. Don't display warning messages
+# cache = TRUE. Only process new code when you knit
+# dev = 'png'. Save graphics in figure folder as png
+# fig.height = 5. Height of figures (in inches)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  comment = "",
+  warning = FALSE,
+  message = FALSE,
+  cache = FALSE,
+  dev = "png", dpi = 300,
+  fig.height = 5
+)
+
+# tidyverse packages
+library(tidyr)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(lubridate)
+
+# summary of data frame columns
+library(skimr)
+
+library(GGally) # for scatterplots with correlation with ggpairs()
+
+# https://docs.stadiamaps.com/guides/migrating-from-stamen-map-tiles/#ggmap
+# devtools::install_github("stadiamaps/ggmap”)
+library(ggmap) # get_stamenmap() & ggmap
+# register_stadiamaps("ff428357-71cc-4a08-8912-9111113265ec", write = TRUE)
+
+library(ggrepel) # geom_text_repel()
+
+# For map plotting
+library(sf)
+
+# devtools::install_github("ropensci/rnaturalearthhires")
+library(rnaturalearthhires)
+library(rnaturalearth)
+library(rnaturalearthdata)
+
+rm(list = ls())
+
+source("auxiliary.code.R")
+
+unlink("Output/Data", recursive = TRUE)
+dir.create("Output/Data")
+```
+
+# Isotope data
+
+## Raw data
+
+From the directory:
+
+`O:\FWWR1708\Working\Task 4 - Field\Isotope work\writing\Paper 2. Bruce lead\data\Bruce precip analysis`
+
+The data file for measured data is "precip.iso.data_BD.csv".
+
+For the measured data file, some characterisations and summaries follow.
+
+```{r}
+ddata <- readr::read_csv("data/precip.iso.data_BD.csv")
+ddata.orig <- ddata
+
+slice_head(ddata.orig, n = 5)
+```
+
+The variable column contains six "variables":
+`r unique(ddata$variable)`.
+
+```{r}
+ddata |> count(variable)
+```
+
+The day of the month for the measurement isn't given, so the measurement is located in the middle of the month.  
+
+```{r}
+ddata <- filter(ddata.orig, variable == "d18O") |>
+  rename(d18O = val, Site = site.number) |>
+  mutate(Date = lubridate::make_date(year = year, month = month, day = 15))
+```
+
+d2H. 
+
+
+```{r}
+ddata2 <- filter(ddata.orig, variable == "dD") |>
+  rename(dD = val, Site = site.number) |>
+  mutate(Date = lubridate::make_date(year = year, month = month, day = 15))
+```
+
+```{r}
+skimr::skim(ddata)
+```
+dD
+
+```{r}
+skimr::skim(ddata2)
+```
+
+## Locations of sites
+
+Site information (e.g. lat, long, elevation, district) is in the file
+"lookup_rainsite_VCSN.csv". Or at least the closest VCSN.
+
+```{r data site information}
+site.info.orig <- readr::read_csv("data/lookup_rainsite_VCSN.csv")
+
+site.info <- site.info.orig |>
+  dplyr::select(Site = site_numbe, area, lat, lon = long, height = ELEVATION)
+slice_head(site.info, n = 5)
+```
+
+Site location is shown by North Island and South Island.
+
+```{r fig.height=8}
+iso_plot_site_locations(site.info, "Site", "lat", "lon", "NI")
+iso_plot_site_locations(site.info, "Site", "lat", "lon", "SI")
+```
+
+## Plots of raw data
+
+```{r raw d18O plotted, fig.height=10}
+iso_plot_raw(ddata, "Site", "Date", "d18O",
+  "Raw d18O by site (1-20)",
+  sites = paste(1:20)
+)
+iso_plot_raw(ddata, "Site", "Date", "d18O",
+  "Raw d18O by site (21-41)",
+  sites = paste(21:41)
+)
+iso_plot_raw(ddata, "Site", "Date", "d18O",
+  "Raw d18O by site (42-58)",
+  sites = paste(42:58)
+)
+```
+
+
+
+```{r raw dD plotted, fig.height=10}
+iso_plot_raw(ddata2, "Site", "Date", "dD",
+  "Raw dD by site (1-20)",
+  sites = paste(1:20)
+)
+iso_plot_raw(ddata2, "Site", "Date", "dD",
+  "Raw dD by site (21-41)",
+  sites = paste(21:41)
+)
+iso_plot_raw(ddata2, "Site", "Date", "dD",
+  "Raw dD by site (42-58)",
+  sites = paste(42:58)
+)
+```
+
+## Save final isotope data set
+
+Sites with few data points are dropped, and NA measured values.
+
+```{r}
+ddata <- ddata |>
+  filter(!(Site %in% c(8, 9, 12, 40, 45))) |>
+  drop_na(d18O)
+```
+
+
+Same for dD.
+
+```{r}
+ddata2 <- ddata2 |>
+  filter(!(Site %in% c(8, 9, 12, 40, 45))) |>
+  drop_na(dD)
+```
+
+
+```{r}
+save(ddata,  file = "ProcessedData/ddata.RData")
+slice_head(ddata, n = 5)
+
+save(ddata2, file = "ProcessedData/ddata2.RData")
+slice_head(ddata2, n = 5)
+
+```
+
+
+# The VCSN climate and environmental data
+
+## The virtual climate station network (VCSN) data
+
+An overview of the virtual climate station data is available here:
+
+<https://niwa.co.nz/climate/our-services/virtual-climate-stations>
+
+"Virtual Climate station Network (VCSN) data are estimates of daily
+rainfall, potential evapotranspiration, air and vapour pressure, maximum
+and minimum air temperature, soil temperature, relative humidity, solar
+radiation, wind speed and soil moisture on a regular (\~5km) grid
+covering the whole of New Zealand. The estimates are produced every day,
+based on the spatial interpolation of actual data observations made at
+climate stations located around the country."
+
+One form in which the VCSN data are available is a series of yearly
+zipped up files in the directory.
+
+"Q:/CLIMATE/vcsn_data/"
+
+The CRS seems to be NZGD 1949
+
+<https://one.niwa.co.nz/display/CLIDB/VCSN+Grid+Points>
+
+As described here:
+
+<https://www.linz.govt.nz/data/geodetic-system/datums-projections-and-heights/geodetic-datums/new-zealand-geodetic-datum-1949-nzgd1949>
+
+With EPSG number of 27258
+
+<https://epsg.io/27258>
+
+## Extracting daily VCSN daily data
+
+Some function were made to explore and extract the VCSN data:
+
+(a) `vcsn_info()`
+(b) `vcsn_agent_locations()`
+(c) `vcsn_append_nearest_vcsn()`
+(d) `vcsn_append_climate_information()`
+
+These functions are used below.
+
+Set up the directory with the VCSN climate data. Sometimes before
+extracting data, the Q drive will need to be "woken up" by clicking on
+it in Windows Explorer.
+
+```{r}
+# VCSN.directory <- "Q:/CLIMATE/vcsn_data/"
+# vcsn_info(VCSN.directory)
+```
+
+Find all the vcsn climate station/agent locations. The output is an sf
+class object, and can be plotted.
+
+```{r plot vcsn agent locations}
+# vcsn.agent.locations  <- vcsn_agent_locations(VCSN.directory) 
+# save(vcsn.agent.locations, file = "ProcessedData/vcsn.agent.locations.RDdata")
+load(file = "ProcessedData/vcsn.agent.locations.RDdata")
+slice_head(vcsn.agent.locations, n = 5)
+plot(vcsn.agent.locations["Agent"], cex = 0.5, pch = 16)
+```
+
+
+Append nearest agent information and daily climate data for 2007--2022.
+This takes a while, so is done once and the results saved, then loaded.
+
+```{r extract climate information for sites}
+# years <- 2023
+# site.info.plus.climate.data <- vcsn_append_climate_information(site.info,VCSN.directory,
+
+#                                                       years)
+
+# save(site.info.plus.climate.data, file = "output/site.info.plus.climate.data.RData")
+
+load(file = "ProcessedData/site.info.plus.climate.data.RData")
+slice_head(site.info.plus.climate.data, n = 5)
+```
+
+The climate fields are identified as
+
+<https://one.niwa.co.nz/display/CLIDB/VCSN+Times+and+Field+Descriptions>
+
+<https://one.niwa.co.nz/display/SYSTEMS/The+size+of+the+problem>
+
+(a) MSLP (Mean Sea Level Pressure)
+(b) PET (Potential Evapotranspiration)
+(c) Rain (daily rainfall)
+(d) RH (relative humidity)
+(e) SoilM (soil moisture)
+(f) ETmp (earth temperature at 10cm depth)
+(g) Rad (solar radiation)
+(h) TMax (maximum temperature)
+(i) Tmin (minimum temperature)
+(j) VP (vapour pressure)
+(k) Wind (average wind speed at 10m above ground level)
+(l) Rain_bc (Rainfall with bias correction)
+(m) Tmax_N (maximum temperature via different method)
+(n) Tmin_N (minimum temperature via different method)
+
+Potential evaporation or potential evapotranspiration is defined as the
+amount of evaporation that would occur if a sufficient water source were
+available.
+
+*Rain_bc*, *Tmax_n*, *Tmin_N* were introduced in 2019.
+
+
+## Mean value from 2007-2022
+
+Convert to long format and make a summary via the mean value 2007--2022 by site.
+
+```{r convert climate information and summary over years}
+site.info.plus.climate.data.long <- site.info.plus.climate.data |> 
+  relocate(height, .after = "Date") |> 
+  pivot_longer(height:Tmin_N, names_to = "Site quantity", values_to = "Value") |> 
+  dplyr::select(-c("area", "lat", "lon"))
+
+slice_head(site.info.plus.climate.data.long, n = 5)
+
+# mean values over 2007-2022 (inclusive)
+site.climate.summary <- site.info.plus.climate.data.long |> 
+  group_by(Site, VCSN.lat, VCSN.lon, `Site quantity`) |> 
+  summarise(mean = mean(Value, na.rm = TRUE)) |> 
+  pivot_wider(names_from = `Site quantity`, values_from = mean) |> 
+  ungroup()
+
+slice_head(site.climate.summary, n = 5)
+
+rm(site.info.plus.climate.data.long)
+```
+
+Calculate mean annual range of monthly temperatures:
+
+Take monthly average daily maximum temperature for each site and month of the time series
+
+Pick the highest month for each year
+
+Pick the lowest for each year
+
+Subtract lowest from highest for each year to give annual range
+
+Take the average range across all years == mean annual range of monthly temperatures
+
+```{r}
+#  Convert to date if not already
+site.info.plus.climate.data$Date <- as.Date(site.info.plus.climate.data$Date)
+#  Get months
+site.info.plus.climate.data$Month <- months(site.info.plus.climate.data$Date)
+#  Get years
+site.info.plus.climate.data$Year <- format(site.info.plus.climate.data$Date,format="%y")
+
+#Get mean annual range of maximum daily temperatures (averaged for each month) each VCSN.Agent, month and year combination
+
+aggy <- aggregate(TMax ~ VCSN.Agent + Site + Month + Year, data = site.info.plus.climate.data, mean)
+
+aggyMAX <- aggregate(TMax ~ VCSN.Agent + Site + Year, data = aggy, max)
+aggyMIN <- aggregate(TMax ~ VCSN.Agent + Site + Year, data = aggy, min)
+aggyRANGE <- aggyMIN
+aggyRANGE$AnnualTempRange <- aggyMAX$TMax - aggyMIN$TMax
+annualranges <- aggregate(AnnualTempRange ~ VCSN.Agent + Site, data = aggyRANGE, mean)
+
+site.climate.summary<-dplyr::left_join(site.climate.summary, annualranges, by = "Site")
+
+rm(site.info.plus.climate.data)
+rm(aggy)
+rm(aggyMAX)
+rm(aggyMIN)
+rm(aggyRANGE)
+```
+
+Now make the same VCSN summary file for 2007-2022, but across all VCSN points so that we can use it to extrapolate regression relationships across the country
+
+
+
+```{r}
+slice_head(vcsn.agent.locations, n = 5) 
+dim(vcsn.agent.locations)
+
+#get list of all VCSN agent numbers and elevations
+
+elevations<-read.csv("data/VCS_elevations.csv")
+keeps<-subset(elevations, select = c(AGENT_NO, ELEVATION))
+names(keeps)<-c("Agent", "elevation")
+elevations<-keeps
+
+# # test run
+# #  vcsn.2007.2022 <- vcsn_combine_daily_data(VCSN.directory, years = 2007)
+# # test run went fine but the line below took over a day and needs to be run on the modelling computer
+# # vcsn.2007.2022 <- vcsn_combine_daily_data(VCSN.directory, years = 2007:2022)
+# # save(vcsn.2007.2022, file = "output/vcsn.2007.2022.RData")
+
+# load("output/vcsn.2007.2022.RData")
+
+# # calculate annual ranges of monthly average temperatures
+
+# #  Convert to date if not already
+# vcsn.2007.2022$Date <- as.Date(vcsn.2007.2022$Date)
+# #  Get months
+# vcsn.2007.2022$Month <- months(vcsn.2007.2022$Date)
+# #  Get years
+# vcsn.2007.2022$Year <- format(vcsn.2007.2022$Date,format="%y")
+
+#  # Get mean annual range of maximum daily temperatures (averaged for each month) for each VCSN.Agent, month and year combination
+
+# aggy1 <- aggregate(TMax ~ Agent + Month + Year, data = vcsn.2007.2022, mean)
+#
+# aggyMAX <- aggregate(TMax ~ Agent + Year, data = aggy1, max)
+# aggyMIN <- aggregate(TMax ~ Agent + Year, data = aggy1, min)
+#
+# aggyRANGE<-aggyMIN
+# aggyRANGE$AnnualTempRange<-aggyMAX$TMax - aggyMIN$TMax
+#
+# annualranges<-aggregate(AnnualTempRange ~ Agent, data = aggyRANGE, mean)
+
+
+# vcsn.mean <- vcsn.2007.2022 |>
+#   dplyr::select(-Tmin, -TMax,
+#                 -Rain)  |>
+#   rename(lat = Lat, lon = Longt) |>
+#   group_by(Agent, lat, lon) |>
+#   summarise(across(.cols = MSLP:Rain_bc, .fns = ~mean(.x, na.rm = TRUE)))
+#
+# national.climate.summary<-dplyr::left_join(vcsn.mean, annualranges, by = "Agent")
+# #add elevations
+# national.climate.summary<-dplyr::left_join(national.climate.summary, elevations, by = "Agent")
+#
+# names(vcsn.mean)
+# vcsn.mean<-national.climate.summary[,1:14]
+# names(vcsn.mean)<-c("Agent", "lat", "lon", "MSLP", "PET" , "RH"      ,        "SoilM"    ,       "ETmp"
+#  ,"Rad"     ,        "VP"      ,        "Wind"      ,      "Rain_bc"   ,      "AnnualTempRange", "height")
+
+
+# removing large R objects
+# rm(vcsn.2007.2022)
+# rm(aggy1)
+# rm(aggyMAX)
+# rm(aggyMIN)
+# rm(aggyRANGE)
+
+# save(national.climate.summary, file = "ProcessedData/national.climate.summary.RData")
+# save(vcsn.mean, file = "ProcessedData/vcsn.mean.RData")
+
+load("ProcessedData/national.climate.summary.RData")
+load("ProcessedData/vcsn.mean.RData")
+```
+
+
+Introduce an "island" column with values South Island/North Island. 
+
+```{r}
+site.climate.summary <- site.climate.summary |> 
+  mutate(island = if_else(VCSN.lon <= 174.49 & VCSN.lat <= -40.18, 
+                          "South Island",
+                          "North Island")) |> 
+  relocate(island, .after = Site) 
+```
+
+Change some names and add the same "island" column for the national VCSN dataframe for mapping later 
+
+```{r}
+names(national.climate.summary)<-c("VCSN.Agent", "VCSN.lat", "VCSN.lon", "MSLP", "PET", "RH", "SoilM", "ETmp", 
+ "Rad", "VP", "Wind", "Rain_bc", "AnnualTempRange", "height")
+
+national.climate.summary <- national.climate.summary |> 
+  mutate(island = if_else(VCSN.lon <= 174.49 & VCSN.lat <= -40.18, 
+                          "South Island",
+                          "North Island")) |> 
+  relocate(island, .after = height) 
+```
+
+Make climate summary by site data frame into an sf object. Make climate summary by site data frame into an sf object. 
+
+```{r}
+site.climate.summary.sf <- site.climate.summary |> 
+  sf::st_as_sf(coords = c("VCSN.lon", "VCSN.lat"), crs = 4326)
+```
+
+Make national climate summary into an sf object...and take a look at the annual temperature range nationally
+
+```{r}
+vcsn.agent.locations1 <- vcsn.agent.locations
+names(vcsn.agent.locations1) <- c("VCSN.Agent", "vcsn.lon", "vcsn.lat", "geometry")
+national.climate.summary.sf <- dplyr::full_join(national.climate.summary, 
+                                                vcsn.agent.locations1,
+                                                by = "VCSN.Agent")
+national.climate.summary.sf <- st_as_sf(national.climate.summary.sf)
+
+plot(national.climate.summary.sf["AnnualTempRange"], cex = 0.5, pch = 16)
+```
+
+
+
+## Plots of mean rainfall and soil moisture at sites
+
+Plot showing mean rainfall and soil moisture at sites. Both have 
+potential to be proxies for orographic effects due to mountain ranges.
+
+*Rain_bc* the bias corrected version of *Rain* is used. 
+
+```{r plot simple of rainfall}
+plot(site.climate.summary.sf["Rain_bc"], cex = 0.5, pch = 16)
+```
+
+```{r nzmap sf object1}
+nzmap <- rnaturalearth::ne_countries(scale = 'large', 
+                      country = "New Zealand",
+                      returnclass = 'sf')
+```
+
+
+```{r plot rainfall with NZ map}
+ggplot() + 
+    geom_sf(data = nzmap, fill = "tan1") + 
+    geom_sf(data = site.climate.summary.sf,
+            mapping = aes(size = Rain_bc, colour = Rain)) +
+    coord_sf(xlim = c(164.8, 179.4), ylim = c(-47.7, -33.8)) +
+    scale_colour_viridis_c() +
+    xlab("Longitude") +
+    ylab("Latitude") +
+    ggtitle("Mean daily rainfall (2007-2022)")
+```
+
+
+```{r plot soil moisture with NZ map}
+ggplot() + 
+    geom_sf(data = nzmap, fill = "tan1") + 
+    geom_sf(data = site.climate.summary.sf,
+            mapping = aes(size = SoilM, colour = SoilM)) +
+    coord_sf(xlim = c(164.8, 179.4), ylim = c(-47.7, -33.8)) +
+    scale_colour_viridis_c() +
+    xlab("Longitude") +
+    ylab("Latitude") +
+    ggtitle("Mean soil moisture (2007-2022)")
+```
+
+
+```{r plot negative soil moisture with NZ map}
+ggplot() + 
+    geom_sf(data = nzmap, fill = "tan1") + 
+    geom_sf(data = site.climate.summary.sf,
+            mapping = aes(size = -SoilM, colour = -SoilM)) +
+    coord_sf(xlim = c(164.8, 179.4), ylim = c(-47.7, -33.8)) +
+    scale_colour_viridis_c() +
+    xlab("Longitude") +
+    ylab("Latitude") +
+    ggtitle("Negative mean soil moisture (2007-2022)")
+```
+
+The soil moisture plateaus as rainfall increases. 
+
+```{r plot mean soil moisture vs mean rainfall}
+ggplot(site.climate.summary.sf, aes(x = Rain_bc, y = SoilM)) +
+  geom_point(colour = "blue") +
+  xlab("Mean daily rainfall") +
+  ylab("Mean soil moisture") +
+  ggtitle("Sites: soil moisture vs rainfall (mean 2007-09)")
+```
+
+
+
+
+## Correlation between VCSN predictor variables
+
+There is high correlation between many VCSN variables, and for the purposes
+of latter regression/correlation analyses with estimated sinusoidal parameters, 
+some VCSN variables can be dropped. 
+
+Concentrating on "temperature" variables, *Tmin* and *TMax* are highly
+correlated with the variables *Tmin_N*, and *Tmax_n*, which in turn are
+highly correlated with *ETmp* (earth temperature at 10cm depth).
+
+So *ETmp* is retained but the other four are dropped (*Tmin*, *TMax*, *Tmin_N*, *Tmax_N*).
+
+We will also retain the *AnnualTempRange* metric
+
+```{r correlation between temperature site characteristics}
+site.T <- site.climate.summary |> 
+  dplyr::select(ETmp, Rad, TMax, Tmin, Tmax_N, Tmin_N)
+
+GGally::ggpairs(site.T)
+corrplot::corrplot(cor(site.T), diag = FALSE, order = "hclust" )
+```
+
+Concentrating on "non-temperature" variables. *Rain* is dropped and the
+bias-corrected version *Rain_bc* is retained.
+
+```{r correlation between non temperature site characteristics, cache=FALSE}
+site.non.T <- site.climate.summary |> 
+  dplyr::select(MSLP, PET, Rain, SoilM, VP, Wind, Rain_bc, height, AnnualTempRange)
+
+GGally::ggpairs(site.non.T)
+corrplot::corrplot(cor(site.non.T), diag = FALSE, order = "hclust" )
+```
+
+```{r correlation between remaining site characteristics, fig.height=10}
+site.remain <- site.climate.summary |> 
+  dplyr::select(-Site, -island, 
+                -TMax, -Tmin, -Tmax_N, -Tmin_N,
+                -Rain)
+
+GGally::ggpairs(site.remain)
+corrplot::corrplot(cor(site.remain), diag = FALSE, order = "hclust" )
+```
+
+
+# Saved data
+
+These data are need for the next block of code (01-isoscape-model-fits-regressions.Rmd).
+
+## d18O data
+
+
+```{r}
+save(ddata, file = "Output/Data/ddata.RData")
+dim(ddata)
+names(ddata)
+```
+
+## Site climate mean value data
+
+Mean value of climate variable at a **site**, for the closest agent. Taking the 
+mean value over all data for 2007 to 2022. 
+
+```{r}
+save(site.climate.summary, file = "Output/Data/site.climate.summary.RData")
+dim(site.climate.summary)
+names(site.climate.summary)
+```
+
+## Agent locations
+
+
+```{r}
+save(vcsn.agent.locations, file = "Output/Data/vcsn.agent.locations.RData")
+dim(vcsn.agent.locations)
+names(vcsn.agent.locations)
+```
+
+Same things, but slightly different column names.
+
+```{r}
+save(vcsn.agent.locations1, file = "Output/Data/vcsn.agent.locations1.RData")
+dim(vcsn.agent.locations1)
+names(vcsn.agent.locations1)
+```
+
+
+## Agent climate mean value data
+
+Mean value of climate data at an **agent location**. Taking the mean over all data
+from 2007 to 2022. Also includes height at the agent location.
+
+
+```{r}
+save(vcsn.mean, file = "Output/Data/vcsn.mean.RData")
+dim(vcsn.mean)
+names(vcsn.mean)
+```
+
+A slightly different version: 
+
+(a) prefix of VCSN for "Agent","lat", "long",
+(b) includes "island" column (South Island/North Island). 
+
+```{r}
+save(national.climate.summary, file = "Output/Data/national.climate.summary.RData")
+dim(national.climate.summary)
+names(national.climate.summary)
+```
+
+
+
+
+
